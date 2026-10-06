@@ -4,9 +4,7 @@ import {
   TextDocuments,
   ProposedFeatures,
   InitializeParams,
-  DidChangeConfigurationNotification,
   CompletionParams,
-  TextDocumentPositionParams,
   DocumentSymbolParams,
   HoverParams,
   DocumentSymbol,
@@ -17,7 +15,6 @@ import {
   TextDocumentSyncKind,
 } from 'vscode-languageserver/node';
 import { TextDocument } from 'vscode-languageserver-textdocument';
-import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   defaultForgePath,
@@ -31,6 +28,15 @@ import { keywordCompletions, stdlibCompletions, symbolCompletions, typeCompletio
 
 const connection = createConnection(ProposedFeatures.all);
 const documents = new TextDocuments(TextDocument);
+const symbolCache = new Map<string, { version: number; symbols: ForgeSymbol[] }>();
+
+function documentSymbols(doc: TextDocument): ForgeSymbol[] {
+  const cached = symbolCache.get(doc.uri);
+  if (cached?.version === doc.version) return cached.symbols;
+  const symbols = runForgeSymbols(settings, doc.uri, doc.getText());
+  symbolCache.set(doc.uri, { version: doc.version, symbols });
+  return symbols;
+}
 
 let workspaceRoot: string | undefined;
 let settings: ForgeSettings = {
@@ -59,15 +65,14 @@ function folderPath(uri: string): string {
 }
 
 function applyClientConfig(root: string | undefined, cfg?: ForgeClientConfig): void {
+  symbolCache.clear();
   settings = {
     forgePath: cfg?.path || defaultForgePath(root),
-    forgeRoot: cfg?.forgeRoot || root,
-    libDir: cfg?.libDir || (root ? path.join(root, 'build', 'lib') : undefined),
+    forgeRoot: cfg?.forgeRoot,
+    libDir: cfg?.libDir,
     includePaths: cfg?.includePaths?.length
       ? cfg.includePaths
-      : root
-        ? [path.join(root, 'examples')]
-        : [],
+      : root ? [root] : [],
   };
 }
 
@@ -99,14 +104,22 @@ function validate(textDocument: TextDocument): void {
   connection.sendDiagnostics({ uri: textDocument.uri, diagnostics });
 }
 
-documents.onDidChangeContent((change) => validate(change.document));
-documents.onDidClose((e) => connection.sendDiagnostics({ uri: e.document.uri, diagnostics: [] }));
+documents.onDidChangeContent((change) => {
+  // Imports can change symbols in other open documents.
+  symbolCache.clear();
+  validate(change.document);
+});
+connection.onDidChangeWatchedFiles(() => symbolCache.clear());
+documents.onDidClose((e) => {
+  symbolCache.delete(e.document.uri);
+  connection.sendDiagnostics({ uri: e.document.uri, diagnostics: [] });
+});
 documents.listen(connection);
 
 connection.onCompletion((params: CompletionParams) => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return [];
-  const symbols = runForgeSymbols(settings, doc.uri, doc.getText());
+  const symbols = documentSymbols(doc);
   return [...keywordCompletions(), ...typeCompletions(), ...stdlibCompletions(), ...symbolCompletions(symbols)];
 });
 
@@ -114,15 +127,16 @@ connection.onDocumentSymbol((params: DocumentSymbolParams): DocumentSymbol[] => 
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return [];
   const text = doc.getText();
-  const symbols = runForgeSymbols(settings, doc.uri, text);
-  return symbols.map((s) => symbolToLsp(s, text));
+  const symbols = documentSymbols(doc);
+  const lines = text.split('\n');
+  return symbols.map((s) => symbolToLsp(s, lines));
 });
 
-function symbolToLsp(sym: ForgeSymbol, text: string): DocumentSymbol {
+function symbolToLsp(sym: ForgeSymbol, lines: string[]): DocumentSymbol {
   const re = new RegExp(`\\b${sym.name}\\b`);
-  const lineIdx = text.split('\n').findIndex((l) => re.test(l));
+  const lineIdx = lines.findIndex((l) => re.test(l));
   const line = Math.max(0, lineIdx);
-  const col = lineIdx >= 0 ? Math.max(0, text.split('\n')[lineIdx].indexOf(sym.name)) : 0;
+  const col = lineIdx >= 0 ? Math.max(0, lines[lineIdx].indexOf(sym.name)) : 0;
   const label = sym.container ? `${sym.container}.${sym.name}` : sym.name;
   return {
     name: label,

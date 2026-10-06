@@ -1,49 +1,56 @@
 # Forge Language Server
 
-[LSP](https://microsoft.github.io/language-server-protocol/) server for the [Forge](https://github.com/forge-language/forge) programming language.
+Language Server Protocol servers for [Forge](https://github.com/forge-language/forge), maintained independently of the compiler and editor clients.
 
-## Features
+## Native server
 
-- Diagnostics via `forge --check`
-- Completion (keywords, types, stdlib, snippets, symbols)
-- Hover documentation
-- Document symbols (outline)
-
-## Requirements
-
-- Node.js 18+
-- [Forge compiler](https://github.com/forge-language/forge) built and available on `PATH` or configured via editor settings
-
-## Install
+`native/main.fg` builds to `forge-lsp`, a native executable communicating over stdio. Install the Forge SDK first; it includes the compiler, runtime, standard library, headers and CMake package.
 
 ```bash
-npm install
-npm run build
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=/path/to/forge-install
+cmake --build build -j2
+ctest --test-dir build --output-on-failure
+cmake --install build --prefix "$HOME/.local"
 ```
 
-## Run
+For a sibling compiler checkout, configure Forge with an install prefix, build and install it, then use that prefix above. This repository does not include compiler or runtime sources.
+
+## TypeScript server
+
+The Node.js implementation remains available for clients using `forge-language-server`.
 
 ```bash
-npm start
+npm ci
+npm test
+node out/server.js --stdio
 ```
 
-Communicates over stdio (default LSP transport).
+Requires Node.js 18+ and a Forge compiler on `PATH`. `npm start -- --stdio` also starts the server. Diagnostics report compiler launch failures. Temporary buffers are removed after every compiler invocation; imports include the original file's directory. Completion and outline requests share symbols cached by document version.
 
-## Editor integration
+## Editor configuration
 
-Use with [vscode-extension](https://github.com/forge-language/vscode-extension) for VS Code and Cursor.
+Both servers support diagnostics (`forge --check`), completion, hover and document symbols (`forge --symbols-json`). Native initialization options use the same `forge` settings object shown below. The TypeScript server also accepts configuration updates.
 
-## Configuration
+```json
+{
+  "forge": {
+    "path": "/path/to/forge-install/bin/forge",
+    "includePaths": ["/path/to/project/modules"]
+  }
+}
+```
 
-The server reads these settings from the editor client:
+`forge.forgeRoot` and `forge.libDir` are optional toolchain overrides; the compiler normally resolves its installed SDK. Project workspaces no longer assume the compiler's `build/lib` or `examples` layout. Set `forge.lspPath` in your editor to the installed `forge-lsp` binary. See [vscode-extension](https://github.com/forge-language/vscode-extension) and [editor plugins](https://github.com/forge-language/editor-plugins) for clients.
 
-| Setting | Description |
-|---------|-------------|
-| `forge.path` | Path to `forge` binary |
-| `forge.forgeRoot` | Project root (`--forge-root`) |
-| `forge.libDir` | Library directory (`--lib-dir`) |
-| `forge.includePaths` | Extra `-I` module search paths |
+## Claude Code integration
 
-## License
+`scripts/install-claude-lsp.sh` optionally patches an existing oh-my-claudecode installation to recognize `.fg` and run `forge-lsp`. It is separate from building and installing this server; install `forge-lsp` on `PATH` before running it. The patcher checks upstream anchors and skips unfamiliar versions.
 
-MIT
+## Layout
+
+- `native/`: Forge server source.
+- `src/`: TypeScript server, compiler adapter and completion data.
+- `tests/`: native stdio protocol and TypeScript compiler adapter regressions.
+- `scripts/`: optional Claude Code integration.
+
+Licensed under [Apache License 2.0](LICENSE).

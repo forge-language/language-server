@@ -1,7 +1,8 @@
-import { spawnSync } from 'node:child_process';
+import { spawnSync, SpawnSyncReturns } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { Diagnostic, DiagnosticSeverity, Position, Range } from 'vscode-languageserver';
 
 export interface ForgeSettings {
@@ -29,12 +30,23 @@ export function defaultForgePath(workspaceRoot?: string): string {
   return 'forge';
 }
 
-function writeTempSource(uri: string, text: string): string {
+function runCompiler(settings: ForgeSettings, uri: string, text: string, extra: string[]): SpawnSyncReturns<string> {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-lsp-'));
-  const base = path.basename(uri, '.fg') || 'buffer';
-  const file = path.join(dir, `${base}.fg`);
-  fs.writeFileSync(file, text, 'utf8');
-  return file;
+  try {
+    const file = path.join(dir, 'buffer.fg');
+    fs.writeFileSync(file, text, 'utf8');
+    // Unsaved buffers live in /tmp; preserve imports relative to the original file.
+    const localSettings = { ...settings, includePaths: [...settings.includePaths] };
+    try {
+      const sourceDir = path.dirname(fileURLToPath(uri));
+      localSettings.includePaths.unshift(sourceDir);
+    } catch { /* Non-file documents have no local module directory. */ }
+    return spawnSync(settings.forgePath, forgeArgs(localSettings, file, extra), {
+      encoding: 'utf8', maxBuffer: 1024 * 1024, timeout: 10_000,
+    });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 function forgeArgs(settings: ForgeSettings, file: string, extra: string[]): string[] {
@@ -50,13 +62,13 @@ export function runForgeCheck(
   uri: string,
   text: string,
 ): Diagnostic[] {
-  const file = writeTempSource(uri, text);
-  const result = spawnSync(settings.forgePath, forgeArgs(settings, file, ['--check']), {
-    encoding: 'utf8',
-    maxBuffer: 1024 * 1024,
-  });
+  const result = runCompiler(settings, uri, text, ['--check']);
 
   const diagnostics: Diagnostic[] = [];
+  if (result.error) {
+    return [{ severity: DiagnosticSeverity.Error, range: Range.create(0, 0, 0, 1),
+      message: `Cannot run Forge compiler: ${result.error.message}`, source: 'forge' }];
+  }
   const stderr = `${result.stderr ?? ''}${result.stdout ?? ''}`;
   for (const line of stderr.split('\n')) {
     if (!line.startsWith('forge:')) continue;
@@ -90,11 +102,7 @@ export function runForgeSymbols(
   uri: string,
   text: string,
 ): ForgeSymbol[] {
-  const file = writeTempSource(uri, text);
-  const result = spawnSync(settings.forgePath, forgeArgs(settings, file, ['--symbols-json']), {
-    encoding: 'utf8',
-    maxBuffer: 1024 * 1024,
-  });
+  const result = runCompiler(settings, uri, text, ['--symbols-json']);
   if (result.status !== 0 || !result.stdout) return scanSymbolsFromText(text);
   try {
     return JSON.parse(result.stdout) as ForgeSymbol[];

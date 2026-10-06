@@ -1,0 +1,27 @@
+name: Language server
+on: [push, pull_request]
+jobs:
+  typescript:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+  native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: forge-language/forge
+          path: toolchain
+      - run: cmake -S toolchain -B toolchain/build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DCMAKE_INSTALL_PREFIX=${{ runner.temp }}/forge
+      - run: cmake --build toolchain/build --target forge forge_runtime forge_std -j2
+      - run: cmake --install toolchain/build
+      - run: cmake -S . -B build -DCMAKE_PREFIX_PATH=${{ runner.temp }}/forge
+      - run: cmake --build build -j2
+      - run: ctest --test-dir build --output-on-failure

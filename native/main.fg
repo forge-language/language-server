@@ -1,0 +1,793 @@
+import strings;
+import fs;
+import os;
+import proc;
+import json;
+import docstore;
+import lsprpc;
+
+fn is_ident(ch: int): int {
+    if (ch >= 65 && ch <= 90) { return 1; }
+    if (ch >= 97 && ch <= 122) { return 1; }
+    if (ch >= 48 && ch <= 57) { return 1; }
+    if (ch == 95) { return 1; }
+    return 0;
+}
+
+fn q(): string { return str_append("", 34); }
+fn bs(): string { return str_append("", 92); }
+
+fn qs(s: string): string {
+    let out: string = q();
+    out = str_append_str(out, s);
+    out = str_append_str(out, q());
+    return out;
+}
+
+fn json_escape(s: string): string {
+    let n: int = str_len(s);
+    let i: int = 0;
+    let out: string = "";
+    while (i < n) {
+        let ch: int = str_char_at(s, i);
+        if (ch == 34) { out = str_append_str(out, bs()); out = str_append(out, 34); i = i + 1; continue; }
+        if (ch == 92) { out = str_append_str(out, bs()); out = str_append(out, 92); i = i + 1; continue; }
+        if (ch == 10) { out = str_append_str(out, bs()); out = str_append(out, 110); i = i + 1; continue; }
+        if (ch == 13) { out = str_append_str(out, bs()); out = str_append(out, 114); i = i + 1; continue; }
+        if (ch == 9) { out = str_append_str(out, bs()); out = str_append(out, 116); i = i + 1; continue; }
+        if (ch < 32) { i = i + 1; continue; }
+        out = str_append(out, ch);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn qesc(s: string): string {
+    return qs(json_escape(s));
+}
+
+fn kv(key: string, raw_value: string): string {
+    let out: string = q();
+    out = str_append_str(out, key);
+    out = str_append_str(out, q());
+    out = str_append_str(out, ":");
+    out = str_append_str(out, raw_value);
+    return out;
+}
+
+fn join_comma(a: string, b: string): string {
+    if (str_len(a) == 0) { return b; }
+    if (str_len(b) == 0) { return a; }
+    let out: string = str_append_str(a, ",");
+    out = str_append_str(out, b);
+    return out;
+}
+
+fn obj1(fields: string): string {
+    let out: string = str_append_str("{", fields);
+    out = str_append_str(out, "}");
+    return out;
+}
+
+fn arr1(items: string): string {
+    let out: string = str_append_str("[", items);
+    out = str_append_str(out, "]");
+    return out;
+}
+
+fn json_unquote(raw: string): string {
+    let wrapped: string = str_append_str("{", q());
+    wrapped = str_append_str(wrapped, "v");
+    wrapped = str_append_str(wrapped, q());
+    wrapped = str_append_str(wrapped, ":");
+    wrapped = str_append_str(wrapped, raw);
+    wrapped = str_append_str(wrapped, "}");
+    return json_get_path_str(wrapped, "v");
+}
+
+fn cfg_key(name: string): string {
+    return str_append_str("__cfg_", name);
+}
+
+fn cfg_set(name: string, val: string): int {
+    return doc_set(cfg_key(name), val);
+}
+
+fn cfg_get(name: string): string {
+    return doc_get(cfg_key(name));
+}
+
+fn str_starts_with(s: string, prefix: string): int {
+    let n: int = str_len(prefix);
+    if (str_len(s) < n) { return 0; }
+    return str_eq(str_sub(s, 0, n), prefix);
+}
+
+fn extract_after(s: string, prefix: string): string {
+    let n: int = str_len(prefix);
+    return str_sub(s, n, str_len(s) - n);
+}
+
+fn find_char(s: string, ch: int, from: int): int {
+    let n: int = str_len(s);
+    let i: int = from;
+    while (i < n) {
+        if (str_char_at(s, i) == ch) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn split_word_at(s: string, from: int): int {
+    let n: int = str_len(s);
+    let i: int = from;
+    while (i < n) {
+        if (str_char_at(s, i) == 32) { return i; }
+        i = i + 1;
+    }
+    return n;
+}
+
+fn word_list_contains(list: string, word: string): int {
+    let n: int = str_len(list);
+    let i: int = 0;
+    while (i < n) {
+        let j: int = split_word_at(list, i);
+        if (j > i) {
+            let cand: string = str_sub(list, i, j - i);
+            if (str_eq(cand, word)) { return 1; }
+        }
+        i = j + 1;
+    }
+    return 0;
+}
+
+fn str_to_int(s: string): int {
+    let n: int = str_len(s);
+    let i: int = 0;
+    let neg: int = 0;
+    if (n > 0 && str_char_at(s, 0) == 45) { neg = 1; i = 1; }
+    let result: int = 0;
+    while (i < n) {
+        let ch: int = str_char_at(s, i);
+        if (ch < 48 || ch > 57) { break; }
+        result = result * 10 + (ch - 48);
+        i = i + 1;
+    }
+    if (neg == 1) { return 0 - result; }
+    return result;
+}
+
+fn send_raw(obj_json: string): int {
+    lsp_write(obj_json);
+    return 1;
+}
+
+fn send_result(id_raw: string, result_raw: string): int {
+    let fields: string = join_comma(kv("jsonrpc", qs("2.0")), kv("id", id_raw));
+    fields = join_comma(fields, kv("result", result_raw));
+    return send_raw(obj1(fields));
+}
+
+fn send_error(id_raw: string, code: int, message: string): int {
+    let err: string = obj1(join_comma(kv("code", str_from_int(code)), kv("message", qesc(message))));
+    let fields: string = join_comma(kv("jsonrpc", qs("2.0")), kv("id", id_raw));
+    fields = join_comma(fields, kv("error", err));
+    return send_raw(obj1(fields));
+}
+
+fn send_notification(method: string, params_raw: string): int {
+    let fields: string = join_comma(kv("jsonrpc", qs("2.0")), kv("method", qs(method)));
+    fields = join_comma(fields, kv("params", params_raw));
+    return send_raw(obj1(fields));
+}
+
+fn publish_diagnostics(uri: string, diags_array_raw: string): int {
+    let params: string = obj1(join_comma(kv("uri", qs(uri)), kv("diagnostics", diags_array_raw)));
+    return send_notification("textDocument/publishDiagnostics", params);
+}
+
+fn build_diagnostic(sl: int, sc: int, el: int, ec: int, msg: string): string {
+    let start_pos: string = obj1(join_comma(kv("line", str_from_int(sl)), kv("character", str_from_int(sc))));
+    let end_pos: string = obj1(join_comma(kv("line", str_from_int(el)), kv("character", str_from_int(ec))));
+    let range: string = obj1(join_comma(kv("start", start_pos), kv("end", end_pos)));
+    let fields: string = join_comma(kv("range", range), kv("severity", str_from_int(1)));
+    fields = join_comma(fields, kv("message", qesc(msg)));
+    fields = join_comma(fields, kv("source", qs("forge")));
+    return obj1(fields);
+}
+
+fn try_diagnostic_from_line(line: string, had_error: int): string {
+    let trimmed: string = str_trim(line);
+    if (str_starts_with(trimmed, "forge: parse error at ") == 1) {
+        let rest: string = extract_after(trimmed, "forge: parse error at ");
+        let c1: int = find_char(rest, 58, 0);
+        if (c1 < 0) { return ""; }
+        let line_str: string = str_sub(rest, 0, c1);
+        let after1: string = str_sub(rest, c1 + 1, str_len(rest) - c1 - 1);
+        let c2: int = find_char(after1, 58, 0);
+        if (c2 < 0) { return ""; }
+        let col_str: string = str_sub(after1, 0, c2);
+        let msg_raw: string = str_sub(after1, c2 + 1, str_len(after1) - c2 - 1);
+        let msg: string = str_trim(msg_raw);
+        let ln0: int = str_to_int(line_str) - 1;
+        if (ln0 < 0) { ln0 = 0; }
+        let cl0: int = str_to_int(col_str) - 1;
+        if (cl0 < 0) { cl0 = 0; }
+        return build_diagnostic(ln0, cl0, ln0, cl0 + 1, msg);
+    }
+    if (str_starts_with(trimmed, "forge:") == 1) {
+        if (had_error == 0) { return ""; }
+        let msg2: string = str_trim(extract_after(trimmed, "forge:"));
+        return build_diagnostic(0, 0, 0, 1, msg2);
+    }
+    return "";
+}
+
+fn parse_diagnostics(output: string, had_error: int): string {
+    let n: int = str_len(output);
+    let i: int = 0;
+    let line_start: int = 0;
+    let diags: string = "";
+    while (i <= n) {
+        let ch: int = -1;
+        if (i < n) { ch = str_char_at(output, i); }
+        if (ch == 10 || i == n) {
+            let line: string = str_sub(output, line_start, i - line_start);
+            let d: string = try_diagnostic_from_line(line, had_error);
+            if (str_len(d) > 0) {
+                diags = join_comma(diags, d);
+            }
+            line_start = i + 1;
+        }
+        i = i + 1;
+    }
+    return arr1(diags);
+}
+
+fn run_diagnostics(uri: string, text: string): int {
+    let tmp: string = fs_temp_path("forge-lsp-check", ".fg");
+    if (str_len(tmp) == 0) {
+        publish_diagnostics(uri, "[]");
+        return 1;
+    }
+    if (fs_write(tmp, text) == 0) {
+        fs_remove(tmp);
+        publish_diagnostics(uri, "[]");
+        return 1;
+    }
+    let status: int = proc_run_forge(
+        cfg_get("forgePath"), tmp, "--check", cfg_get("forgeRoot"),
+        cfg_get("libDir"), cfg_get("includePaths"));
+    let output: string = proc_output();
+    fs_remove(tmp);
+    let had_error: int = 1;
+    if (status == 0) { had_error = 0; }
+    let diags: string = parse_diagnostics(output, had_error);
+    publish_diagnostics(uri, diags);
+    return 1;
+}
+
+fn get_symbols_json(text: string): string {
+    let tmp: string = fs_temp_path("forge-lsp-symbols", ".fg");
+    if (str_len(tmp) == 0) { return "[]"; }
+    if (fs_write(tmp, text) == 0) {
+        fs_remove(tmp);
+        return "[]";
+    }
+    proc_run_forge(
+        cfg_get("forgePath"), tmp, "--symbols-json", cfg_get("forgeRoot"),
+        cfg_get("libDir"), cfg_get("includePaths"));
+    let output: string = proc_output();
+    fs_remove(tmp);
+    let trimmed: string = str_trim(output);
+    if (str_len(trimmed) == 0) { return "[]"; }
+    if (str_char_at(trimmed, 0) != 91) { return "[]"; }
+    return trimmed;
+}
+
+fn find_symbol_pos(text: string, name: string): int {
+    let n: int = str_len(text);
+    let nlen: int = str_len(name);
+    let i: int = 0;
+    let line: int = 0;
+    let line_start: int = 0;
+    while (i < n) {
+        let ch: int = str_char_at(text, i);
+        if (ch == 10) {
+            line = line + 1;
+            line_start = i + 1;
+            i = i + 1;
+            continue;
+        }
+        if (i + nlen <= n) {
+            let cand: string = str_sub(text, i, nlen);
+            if (str_eq(cand, name)) {
+                let ok_before: int = 1;
+                let ok_after: int = 1;
+                if (i > 0) {
+                    if (is_ident(str_char_at(text, i - 1)) == 1) { ok_before = 0; }
+                }
+                if (i + nlen < n) {
+                    if (is_ident(str_char_at(text, i + nlen)) == 1) { ok_after = 0; }
+                }
+                if (ok_before == 1 && ok_after == 1) {
+                    return line * 1000000 + (i - line_start);
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn lsp_symbol_kind(kind: string): int {
+    if (str_eq(kind, "function")) { return 12; }
+    if (str_eq(kind, "process")) { return 5; }
+    if (str_eq(kind, "coroutine")) { return 6; }
+    if (str_eq(kind, "const")) { return 14; }
+    if (str_eq(kind, "struct")) { return 23; }
+    if (str_eq(kind, "enum")) { return 10; }
+    if (str_eq(kind, "library")) { return 2; }
+    if (str_eq(kind, "supervisor")) { return 3; }
+    if (str_eq(kind, "native")) { return 24; }
+    return 13;
+}
+
+fn symbol_to_lsp_json(item: string, text: string): string {
+    let kind: string = json_get_path_str(item, "kind");
+    let name: string = json_get_path_str(item, "name");
+    let container: string = json_get_path_str(item, "container");
+
+    let label: string = name;
+    if (str_len(container) > 0) {
+        label = str_append_str(container, ".");
+        label = str_append_str(label, name);
+    }
+
+    let pos: int = find_symbol_pos(text, name);
+    let line: int = pos / 1000000;
+    let col: int = pos % 1000000;
+    let name_len: int = str_len(name);
+
+    let skind: int = lsp_symbol_kind(kind);
+
+    let start_pos: string = obj1(join_comma(kv("line", str_from_int(line)), kv("character", str_from_int(col))));
+    let end_pos: string = obj1(join_comma(kv("line", str_from_int(line)), kv("character", str_from_int(col + name_len))));
+    let range: string = obj1(join_comma(kv("start", start_pos), kv("end", end_pos)));
+
+    let fields: string = join_comma(kv("name", qesc(label)), kv("kind", str_from_int(skind)));
+    fields = join_comma(fields, kv("range", range));
+    fields = join_comma(fields, kv("selectionRange", range));
+    return obj1(fields);
+}
+
+fn handle_document_symbol(id_raw: string, msg: string): int {
+    let uri: string = json_get_path_str(msg, "params.textDocument.uri");
+    let text: string = doc_get(uri);
+    let symbols_json: string = get_symbols_json(text);
+    let count: int = json_array_len(symbols_json);
+    let out: string = "";
+    let i: int = 0;
+    while (i < count) {
+        let item: string = json_array_at(symbols_json, i);
+        let lsp_item: string = symbol_to_lsp_json(item, text);
+        out = join_comma(out, lsp_item);
+        i = i + 1;
+    }
+    send_result(id_raw, arr1(out));
+    return 1;
+}
+
+fn build_capabilities(): string {
+    let trigger_chars: string = arr1(join_comma(qs("."), join_comma(qesc(q()), qs(" "))));
+    let completion_provider: string = obj1(kv("triggerCharacters", trigger_chars));
+    let capabilities: string = join_comma(kv("textDocumentSync", str_from_int(1)), kv("completionProvider", completion_provider));
+    capabilities = join_comma(capabilities, kv("hoverProvider", "true"));
+    capabilities = join_comma(capabilities, kv("documentSymbolProvider", "true"));
+    let server_info: string = obj1(join_comma(kv("name", qs("forge-lsp")), kv("version", qs("0.1.0"))));
+    return obj1(join_comma(kv("capabilities", obj1(capabilities)), kv("serverInfo", server_info)));
+}
+
+fn handle_initialize(id_raw: string, msg: string): int {
+    let root: string = json_get_path_str(msg, "params.initializationOptions.workspaceRoot");
+    if (str_len(root) == 0) {
+        root = json_get_path_str(msg, "params.rootUri");
+        if (str_len(root) >= 7) {
+            if (str_eq(str_sub(root, 0, 7), "file://")) {
+                root = str_sub(root, 7, str_len(root) - 7);
+            }
+        }
+    }
+
+    let fpath: string = json_get_path_str(msg, "params.initializationOptions.forge.path");
+    if (str_len(fpath) == 0) { fpath = "forge"; }
+
+    let froot: string = json_get_path_str(msg, "params.initializationOptions.forge.forgeRoot");
+
+    let flib: string = json_get_path_str(msg, "params.initializationOptions.forge.libDir");
+
+    let inc_raw: string = json_get_path(msg, "params.initializationOptions.forge.includePaths");
+    let inc_paths: string = "";
+    let inc_count: int = json_array_len(inc_raw);
+    let i: int = 0;
+    while (i < inc_count) {
+        let item_raw: string = json_array_at(inc_raw, i);
+        let item: string = json_unquote(item_raw);
+        if (str_len(inc_paths) > 0) { inc_paths = str_append_str(inc_paths, "\n"); }
+        inc_paths = str_append_str(inc_paths, item);
+        i = i + 1;
+    }
+    if (inc_count == 0 && str_len(root) > 0) {
+        inc_paths = root;
+    }
+
+    cfg_set("forgePath", fpath);
+    cfg_set("forgeRoot", froot);
+    cfg_set("libDir", flib);
+    cfg_set("includePaths", inc_paths);
+
+    send_result(id_raw, build_capabilities());
+    return 1;
+}
+
+fn handle_did_open(msg: string): int {
+    let uri: string = json_get_path_str(msg, "params.textDocument.uri");
+    let text: string = json_get_path_str(msg, "params.textDocument.text");
+    doc_set(uri, text);
+    run_diagnostics(uri, text);
+    return 1;
+}
+
+fn handle_did_change(msg: string): int {
+    let uri: string = json_get_path_str(msg, "params.textDocument.uri");
+    let changes: string = json_get_path(msg, "params.contentChanges");
+    let first: string = json_array_at(changes, 0);
+    let text: string = json_get_path_str(first, "text");
+    doc_set(uri, text);
+    run_diagnostics(uri, text);
+    return 1;
+}
+
+fn handle_did_close(msg: string): int {
+    let uri: string = json_get_path_str(msg, "params.textDocument.uri");
+    doc_remove(uri);
+    publish_diagnostics(uri, "[]");
+    return 1;
+}
+
+fn hover_doc_for(word: string): string {
+    if (str_eq(word, "process")) { return "A supervised actor. Runs independently, can spawn other processes, and can be restarted by a supervisor on failure."; }
+    if (str_eq(word, "coroutine")) { return "A cooperatively-scheduled lightweight task. Suspends at yield/await points without blocking the OS thread."; }
+    if (str_eq(word, "supervisor")) { return "Owns a set of child processes and restarts them according to a restart strategy when they fail."; }
+    if (str_eq(word, "spawn")) { return "Starts a new process or coroutine and returns a handle to it."; }
+    if (str_eq(word, "yield")) { return "Suspends the current coroutine, allowing other coroutines to run, and resumes later."; }
+    if (str_eq(word, "await")) { return "Suspends until the awaited value or coroutine completes, then resumes with its result."; }
+    if (str_eq(word, "own")) { return "Marks a binding as the unique owner of a value; the value cannot be accessed through any other binding."; }
+    if (str_eq(word, "move")) { return "Transfers ownership of a value to another binding, invalidating the original binding."; }
+    if (str_eq(word, "match")) { return "Pattern-matches a value against a series of arms, executing the first arm whose pattern matches."; }
+    if (str_eq(word, "const")) { return "Declares an immutable, compile-time-known value."; }
+    return "";
+}
+
+fn stdlib_modules(): string {
+    return "io strings math time fs os tcp udp http event json gpu thread proc docstore lsprpc";
+}
+
+fn stdlib_fn_list(mod: string): string {
+    if (str_eq(mod, "io")) { return "print print_int print_str eprint eprint_int eprintln flush flush_err read_line read_char read_stdin prompt write_fd read_fd stdin_fd stdout_fd stderr_fd"; }
+    if (str_eq(mod, "strings")) { return "str_len str_concat str_eq str_sub str_contains str_trim str_char_at str_append str_append_str str_from_int str_reset_arena str_view str_view_len str_view_at str_builder str_builder_append str_builder_char str_builder_finish"; }
+    if (str_eq(mod, "math")) { return "abs_i abs_f min_i max_i clamp_i pow_i"; }
+    if (str_eq(mod, "time")) { return "time_now_ms sleep_ms"; }
+    if (str_eq(mod, "fs")) { return "fs_read fs_write fs_append fs_exists fs_remove fs_size fs_is_file fs_is_dir fs_mkdir fs_rename fs_copy fs_list_dir fs_temp_path"; }
+    if (str_eq(mod, "os")) { return "os_exit os_getenv os_argc os_argv"; }
+    if (str_eq(mod, "tcp")) { return "tcp_listen tcp_accept tcp_connect tcp_send tcp_recv tcp_close net_init"; }
+    if (str_eq(mod, "udp")) { return "udp_bind udp_send udp_recv udp_peer udp_close"; }
+    if (str_eq(mod, "http")) { return "http_get http_post http_listen http_accept http_req_method http_req_path http_req_body http_respond http_close http_server_close http_prepare http_serve_prepared http_serve_forever http_serve_ok http_serve_mt http_serve_hybrid"; }
+    if (str_eq(mod, "event")) { return "event_poll event_add_read"; }
+    if (str_eq(mod, "json")) { return "json_get_string json_get_int json_stringify_str json_stringify_int json_get_path json_get_path_str json_get_path_int json_array_len json_array_at"; }
+    if (str_eq(mod, "gpu")) { return "gpu_available gpu_backend gpu_device_count gpu_device_name gpu_select_device gpu_alloc gpu_free gpu_copy gpu_sync gpu_fill_i32 gpu_write_i32 gpu_read_i32 gpu_add_i32 gpu_mul_i32 gpu_run_kernel"; }
+    if (str_eq(mod, "thread")) { return "thread_cpu_count thread_yield thread_pin thread_self thread_worker_id thread_mutex_create thread_mutex_lock thread_mutex_unlock thread_mutex_destroy thread_join thread_join_all"; }
+    if (str_eq(mod, "proc")) { return "proc_run proc_run_forge proc_output"; }
+    if (str_eq(mod, "docstore")) { return "doc_set doc_get doc_remove"; }
+    if (str_eq(mod, "lsprpc")) { return "lsp_read lsp_write"; }
+    return "";
+}
+
+fn stdlib_hover_doc(word: string): string {
+    let mods: string = stdlib_modules();
+    if (word_list_contains(mods, word) == 1) {
+        return str_append_str(word, " module");
+    }
+    let n: int = str_len(mods);
+    let i: int = 0;
+    while (i < n) {
+        let j: int = split_word_at(mods, i);
+        if (j > i) {
+            let mod: string = str_sub(mods, i, j - i);
+            let fns: string = stdlib_fn_list(mod);
+            if (word_list_contains(fns, word) == 1) {
+                let out: string = str_append_str(mod, ".");
+                out = str_append_str(out, word);
+                return out;
+            }
+        }
+        i = j + 1;
+    }
+    return "";
+}
+
+fn completion_item_kw(name: string): string {
+    let detail: string = hover_doc_for(name);
+    let fields: string = join_comma(kv("label", qs(name)), kv("kind", str_from_int(14)));
+    if (str_len(detail) > 0) {
+        fields = join_comma(fields, kv("detail", qesc(detail)));
+    }
+    return obj1(fields);
+}
+
+fn keyword_completions(): string {
+    let out: string = "";
+    out = join_comma(out, completion_item_kw("process"));
+    out = join_comma(out, completion_item_kw("coroutine"));
+    out = join_comma(out, completion_item_kw("supervisor"));
+    out = join_comma(out, completion_item_kw("spawn"));
+    out = join_comma(out, completion_item_kw("send"));
+    out = join_comma(out, completion_item_kw("recv"));
+    out = join_comma(out, completion_item_kw("yield"));
+    out = join_comma(out, completion_item_kw("on"));
+    out = join_comma(out, completion_item_kw("receive"));
+    out = join_comma(out, completion_item_kw("let"));
+    out = join_comma(out, completion_item_kw("mut"));
+    out = join_comma(out, completion_item_kw("own"));
+    out = join_comma(out, completion_item_kw("move"));
+    out = join_comma(out, completion_item_kw("await"));
+    out = join_comma(out, completion_item_kw("fn"));
+    out = join_comma(out, completion_item_kw("return"));
+    out = join_comma(out, completion_item_kw("if"));
+    out = join_comma(out, completion_item_kw("else"));
+    out = join_comma(out, completion_item_kw("while"));
+    out = join_comma(out, completion_item_kw("for"));
+    out = join_comma(out, completion_item_kw("break"));
+    out = join_comma(out, completion_item_kw("continue"));
+    out = join_comma(out, completion_item_kw("struct"));
+    out = join_comma(out, completion_item_kw("enum"));
+    out = join_comma(out, completion_item_kw("native"));
+    out = join_comma(out, completion_item_kw("extern"));
+    out = join_comma(out, completion_item_kw("import"));
+    out = join_comma(out, completion_item_kw("library"));
+    out = join_comma(out, completion_item_kw("export"));
+    out = join_comma(out, completion_item_kw("true"));
+    out = join_comma(out, completion_item_kw("false"));
+    out = join_comma(out, completion_item_kw("match"));
+    out = join_comma(out, completion_item_kw("const"));
+    out = join_comma(out, completion_item_kw("restart"));
+    return out;
+}
+
+fn completion_item_type(name: string): string {
+    return obj1(join_comma(kv("label", qs(name)), kv("kind", str_from_int(25))));
+}
+
+fn type_completions(): string {
+    let out: string = "";
+    out = join_comma(out, completion_item_type("int"));
+    out = join_comma(out, completion_item_type("float"));
+    out = join_comma(out, completion_item_type("bool"));
+    out = join_comma(out, completion_item_type("string"));
+    out = join_comma(out, completion_item_type("void"));
+    out = join_comma(out, completion_item_type("ptr"));
+    return out;
+}
+
+fn completion_item_mod(mod: string): string {
+    let label: string = str_append_str("import ", mod);
+    label = str_append_str(label, ";");
+    return obj1(join_comma(kv("label", qs(label)), kv("kind", str_from_int(9))));
+}
+
+fn completion_item_fn(name: string, mod: string): string {
+    let detail: string = str_append_str(mod, " module");
+    let fields: string = join_comma(kv("label", qs(name)), kv("kind", str_from_int(3)));
+    fields = join_comma(fields, kv("detail", qs(detail)));
+    return obj1(fields);
+}
+
+fn completion_items_for_fn_list(mod: string, fn_list: string): string {
+    let out: string = "";
+    let n: int = str_len(fn_list);
+    let i: int = 0;
+    while (i < n) {
+        let j: int = split_word_at(fn_list, i);
+        if (j > i) {
+            let name: string = str_sub(fn_list, i, j - i);
+            out = join_comma(out, completion_item_fn(name, mod));
+        }
+        i = j + 1;
+    }
+    return out;
+}
+
+fn stdlib_completions(): string {
+    let mods: string = stdlib_modules();
+    let n: int = str_len(mods);
+    let i: int = 0;
+    let out: string = "";
+    while (i < n) {
+        let j: int = split_word_at(mods, i);
+        if (j > i) {
+            let mod: string = str_sub(mods, i, j - i);
+            out = join_comma(out, completion_item_mod(mod));
+            out = join_comma(out, completion_items_for_fn_list(mod, stdlib_fn_list(mod)));
+        }
+        i = j + 1;
+    }
+    return out;
+}
+
+fn completion_kind_for_symbol(kind: string): int {
+    if (str_eq(kind, "function")) { return 3; }
+    if (str_eq(kind, "process")) { return 7; }
+    if (str_eq(kind, "coroutine")) { return 2; }
+    if (str_eq(kind, "const")) { return 21; }
+    if (str_eq(kind, "struct")) { return 22; }
+    if (str_eq(kind, "enum")) { return 13; }
+    if (str_eq(kind, "library")) { return 9; }
+    return 6;
+}
+
+fn symbol_completions(text: string): string {
+    let symbols_json: string = get_symbols_json(text);
+    let count: int = json_array_len(symbols_json);
+    let out: string = "";
+    let i: int = 0;
+    while (i < count) {
+        let item: string = json_array_at(symbols_json, i);
+        let name: string = json_get_path_str(item, "name");
+        let kind: string = json_get_path_str(item, "kind");
+        let container: string = json_get_path_str(item, "container");
+        let detail: string = kind;
+        if (str_len(container) > 0) {
+            detail = str_append_str(kind, " in ");
+            detail = str_append_str(detail, container);
+        }
+        let ckind: int = completion_kind_for_symbol(kind);
+        let fields: string = join_comma(kv("label", qs(name)), kv("kind", str_from_int(ckind)));
+        fields = join_comma(fields, kv("detail", qesc(detail)));
+        out = join_comma(out, obj1(fields));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn handle_completion(id_raw: string, msg: string): int {
+    let uri: string = json_get_path_str(msg, "params.textDocument.uri");
+    let text: string = doc_get(uri);
+    let items: string = "";
+    items = join_comma(items, keyword_completions());
+    items = join_comma(items, type_completions());
+    items = join_comma(items, stdlib_completions());
+    items = join_comma(items, symbol_completions(text));
+    send_result(id_raw, arr1(items));
+    return 1;
+}
+
+fn get_line_text(text: string, line: int): string {
+    let n: int = str_len(text);
+    let i: int = 0;
+    let cur_line: int = 0;
+    let line_start: int = 0;
+    while (i < n) {
+        if (cur_line == line) { break; }
+        let ch: int = str_char_at(text, i);
+        if (ch == 10) {
+            cur_line = cur_line + 1;
+            line_start = i + 1;
+        }
+        i = i + 1;
+    }
+    if (cur_line != line) { return ""; }
+    let j: int = line_start;
+    while (j < n && str_char_at(text, j) != 10) {
+        j = j + 1;
+    }
+    return str_sub(text, line_start, j - line_start);
+}
+
+fn word_before_cursor(line_text: string, char_pos: int): string {
+    let limit: int = char_pos;
+    if (limit > str_len(line_text)) { limit = str_len(line_text); }
+    let i: int = limit;
+    while (i > 0) {
+        if (is_ident(str_char_at(line_text, i - 1)) == 0) { break; }
+        i = i - 1;
+    }
+    return str_sub(line_text, i, limit - i);
+}
+
+fn handle_hover(id_raw: string, msg: string): int {
+    let uri: string = json_get_path_str(msg, "params.textDocument.uri");
+    let line: int = json_get_path_int(msg, "params.position.line");
+    let character: int = json_get_path_int(msg, "params.position.character");
+    let text: string = doc_get(uri);
+    let line_text: string = get_line_text(text, line);
+    let word: string = word_before_cursor(line_text, character);
+
+    if (str_len(word) == 0) {
+        send_result(id_raw, "null");
+        return 1;
+    }
+
+    let doc: string = hover_doc_for(word);
+    if (str_len(doc) == 0) {
+        doc = stdlib_hover_doc(word);
+    }
+
+    if (str_len(doc) == 0) {
+        send_result(id_raw, "null");
+        return 1;
+    }
+
+    let contents: string = obj1(join_comma(kv("kind", qs("markdown")), kv("value", qesc(doc))));
+    send_result(id_raw, obj1(kv("contents", contents)));
+    return 1;
+}
+
+fn handle_message(msg: string): int {
+    let method: string = json_get_path_str(msg, "method");
+    let id_raw: string = json_get_path(msg, "id");
+
+    if (str_eq(method, "initialize")) {
+        handle_initialize(id_raw, msg);
+        return 1;
+    }
+    if (str_eq(method, "initialized")) { return 1; }
+    if (str_eq(method, "textDocument/didOpen")) {
+        handle_did_open(msg);
+        return 1;
+    }
+    if (str_eq(method, "textDocument/didChange")) {
+        handle_did_change(msg);
+        return 1;
+    }
+    if (str_eq(method, "textDocument/didClose")) {
+        handle_did_close(msg);
+        return 1;
+    }
+    if (str_eq(method, "textDocument/completion")) {
+        handle_completion(id_raw, msg);
+        return 1;
+    }
+    if (str_eq(method, "textDocument/hover")) {
+        handle_hover(id_raw, msg);
+        return 1;
+    }
+    if (str_eq(method, "textDocument/documentSymbol")) {
+        handle_document_symbol(id_raw, msg);
+        return 1;
+    }
+    if (str_eq(method, "shutdown")) {
+        send_result(id_raw, "null");
+        return 1;
+    }
+    if (str_eq(method, "exit")) {
+        os_exit(0);
+        return 0;
+    }
+    if (str_len(id_raw) > 0) {
+        send_error(id_raw, 0 - 32601, str_append_str("Method not found: ", method));
+    }
+    return 1;
+}
+
+native main {
+    let running: int = 1;
+    while (running == 1) {
+        let msg: string = lsp_read();
+        if (str_len(msg) == 0) {
+            running = 0;
+            continue;
+        }
+        handle_message(msg);
+    }
+}

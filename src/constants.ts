@@ -34,6 +34,11 @@ export const STDLIB_MODULES: Record<string, string[]> = {
   ],
   event: ['event_poll', 'event_add_read'],
   json: ['json_get_string', 'json_get_int', 'json_stringify_str', 'json_stringify_int'],
+  gpu: [
+    'gpu_available', 'gpu_backend', 'gpu_device_count', 'gpu_device_name', 'gpu_select_device',
+    'gpu_alloc', 'gpu_free', 'gpu_copy', 'gpu_sync',
+    'gpu_fill_i32', 'gpu_write_i32', 'gpu_read_i32', 'gpu_add_i32', 'gpu_mul_i32', 'gpu_run_kernel',
+  ],
 };
 
 export const SNIPPETS: Record<string, string> = {
