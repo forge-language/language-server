@@ -26,3 +26,35 @@ assert [response["id"] for response in responses] == [1, 2, 3]
 assert "capabilities" in responses[0]["result"]
 assert "str_builder" in [entry["label"] for entry in responses[1]["result"]]
 print("native LSP initialize/completion/shutdown passed")
+
+# A missing compiler or nonstandard loader error must not look like valid code.
+import tempfile
+from pathlib import Path
+with tempfile.TemporaryDirectory(prefix="native-lsp-failure-") as directory:
+    compiler = Path(directory) / "compiler"
+    compiler.write_text("#!/bin/sh\necho 'runtime library missing' >&2\nexit 17\n")
+    compiler.chmod(0o755)
+    for selected in (str(compiler), str(Path(directory) / "missing")):
+        failure_messages = [
+            {"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{"capabilities":{}, "initializationOptions":{"forge":{"path":selected}}}},
+            {"jsonrpc":"2.0", "method":"textDocument/didOpen", "params":{"textDocument":{"uri":"file:///tmp/main.fg","languageId":"forge","version":1,"text":"native main { return 0; }"}}},
+            {"jsonrpc":"2.0", "id":2, "method":"shutdown", "params":None},
+            {"jsonrpc":"2.0", "method":"exit"},
+        ]
+        request = b""
+        for message in failure_messages:
+            body = json.dumps(message).encode()
+            request += b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+        run = subprocess.run([sys.argv[1]], input=request, capture_output=True, timeout=10)
+        assert run.returncode == 0, run.stderr.decode()
+        remaining = run.stdout
+        diagnostics = None
+        while remaining:
+            header, remaining = remaining.split(b"\r\n\r\n", 1)
+            size = int(header.split(b":", 1)[1])
+            response = json.loads(remaining[:size]); remaining = remaining[size:]
+            if response.get("method") == "textDocument/publishDiagnostics":
+                diagnostics = response["params"]["diagnostics"]
+        assert diagnostics, "Compiler failure was reported as valid code"
+        assert "forge.path" in diagnostics[0]["message"] or "runtime library missing" in diagnostics[0]["message"]
+print("native compiler startup failures remain visible")

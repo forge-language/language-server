@@ -18,15 +18,9 @@ export interface ForgeSymbol {
   container?: string;
 }
 
-export function defaultForgePath(workspaceRoot?: string): string {
-  const candidates = [
-    workspaceRoot ? path.join(workspaceRoot, 'build', 'bin', 'forge') : '',
-    path.join(process.cwd(), 'build', 'bin', 'forge'),
-    'forge',
-  ].filter(Boolean);
-  for (const c of candidates) {
-    if (c !== 'forge' && fs.existsSync(c)) return c;
-  }
+export function defaultForgePath(_workspaceRoot?: string): string {
+  // Opening a project must not select its build/bin executable as a compiler.
+  // A local compiler can still be selected explicitly through forge.path.
   return 'forge';
 }
 
@@ -67,7 +61,7 @@ export function runForgeCheck(
   const diagnostics: Diagnostic[] = [];
   if (result.error) {
     return [{ severity: DiagnosticSeverity.Error, range: Range.create(0, 0, 0, 1),
-      message: `Cannot run Forge compiler: ${result.error.message}`, source: 'forge' }];
+      message: `Cannot run Forge compiler: ${result.error.message}. Install Forge or set forge.path to its executable.`, source: 'forge' }];
   }
   const stderr = `${result.stderr ?? ''}${result.stdout ?? ''}`;
   for (const line of stderr.split('\n')) {
@@ -93,6 +87,13 @@ export function runForgeCheck(
         source: 'forge',
       });
     }
+  }
+  if (diagnostics.length === 0 && (result.status !== 0 || result.signal)) {
+    const detail = stderr.trim().slice(0, 2000);
+    const failure = result.signal ? `signal ${result.signal}` : `exit code ${result.status}`;
+    diagnostics.push({ severity: DiagnosticSeverity.Error, range: Range.create(0, 0, 0, 1),
+      message: `Forge compiler failed (${failure}). Check forge.path and the installed SDK.${detail ? ` ${detail}` : ''}`,
+      source: 'forge' });
   }
   return diagnostics;
 }

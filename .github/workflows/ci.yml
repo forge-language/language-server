@@ -1,5 +1,8 @@
 name: Language server
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
+  workflow_call:
 jobs:
   typescript:
     runs-on: ubuntu-latest
@@ -12,12 +15,13 @@ jobs:
       - run: npm ci
       - run: npm test
   native:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
         with:
           repository: forge-language/forge
+          ref: 9b1d1a6c86a688ba56158bd5c014d836c151f289
           path: toolchain
       - run: cmake -S toolchain -B toolchain/build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DCMAKE_INSTALL_PREFIX=${{ runner.temp }}/forge
       - run: cmake --build toolchain/build --target forge forge_runtime forge_std -j2
@@ -25,3 +29,16 @@ jobs:
       - run: cmake -S . -B build -DCMAKE_PREFIX_PATH=${{ runner.temp }}/forge
       - run: cmake --build build -j2
       - run: ctest --test-dir build --output-on-failure
+      - name: Check the installed toolchain and real stdio session
+        run: python3 scripts/doctor.py --compiler ${{ runner.temp }}/forge/bin/forge --server "$PWD/build/bin/forge-lsp"
+      - name: Package Linux server
+        run: |
+          mkdir -p release/forge-lsp/bin release/forge-lsp/scripts
+          cp build/bin/forge-lsp release/forge-lsp/bin/
+          cp LICENSE README.md release/forge-lsp/
+          cp scripts/doctor.py release/forge-lsp/scripts/
+          tar -czf forge-lsp-linux-x86_64.tar.gz -C release forge-lsp
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-language-server
+          path: forge-lsp-linux-x86_64.tar.gz

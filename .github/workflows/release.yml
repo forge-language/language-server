@@ -1,0 +1,30 @@
+name: Publish language servers
+on:
+  push:
+    tags: ['v[0-9]*']
+permissions:
+  contents: read
+jobs:
+  validate:
+    uses: ./.github/workflows/ci.yml
+  publish:
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm pack
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-language-server
+      - run: sha256sum forge-lsp-linux-x86_64.tar.gz forge-language-server-*.tgz > SHA256SUMS
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" forge-lsp-linux-x86_64.tar.gz forge-language-server-*.tgz SHA256SUMS --verify-tag --title "Forge language servers $GITHUB_REF_NAME" --notes-file RELEASE_NOTES.md

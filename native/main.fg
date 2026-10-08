@@ -242,18 +242,25 @@ fn parse_diagnostics(output: string, had_error: int): string {
         }
         i = i + 1;
     }
+    if (had_error == 1 && str_len(diags) == 0) {
+        let detail: string = str_trim(output);
+        if (str_len(detail) > 2000) { detail = str_sub(detail, 0, 2000); }
+        let message: string = "Forge compiler failed. Check forge.path and the installed SDK.";
+        if (str_len(detail) > 0) { message = str_append_str(str_append_str(message, " "), detail); }
+        diags = build_diagnostic(0, 0, 0, 1, message);
+    }
     return arr1(diags);
 }
 
 fn run_diagnostics(uri: string, text: string): int {
     let tmp: string = fs_temp_path("forge-lsp-check", ".fg");
     if (str_len(tmp) == 0) {
-        publish_diagnostics(uri, "[]");
+        publish_diagnostics(uri, arr1(build_diagnostic(0, 0, 0, 1, "Cannot create a temporary source file. Check the temporary directory and available disk space.")));
         return 1;
     }
     if (fs_write(tmp, text) == 0) {
         fs_remove(tmp);
-        publish_diagnostics(uri, "[]");
+        publish_diagnostics(uri, arr1(build_diagnostic(0, 0, 0, 1, "Cannot write a temporary source file. Check permissions and available disk space.")));
         return 1;
     }
     let status: int = proc_run_forge(
