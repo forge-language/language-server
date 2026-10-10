@@ -1,2 +1,0 @@
-
-Compilers that append `forge: location: <file>:<line>:<column>-<end-line>:<end-column>` to a legacy error now supply the editor range without a duplicate diagnostic. Coordinates use the compiler's UTF-16 contract. Imported-module failures retain their file and location in the message and use a document-level fallback range, since imported coordinates belong to another source. Older compilers retain the existing fallback. The server does not require the new compiler flag. Signal termination is reported as a compiler failure separately from a missing executable.

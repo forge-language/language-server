@@ -101,3 +101,7 @@ state, debounce decisions and LSP publication must remain in `.fg` code. Shared
 protocol fixtures should then verify cancellation, version ordering, close,
 settings, timeout and source cleanup for both servers. Moving hidden LSP routing
 into a C bridge would not be that implementation.
+
+## Source locations and compiler failures
+
+Compilers that append `forge: location: <file>:<line>:<column>-<end-line>:<end-column>` to a legacy error now supply the editor range without a duplicate diagnostic. Coordinates use the compiler's UTF-16 contract. Imported-module failures retain their file and location in the message and use a document-level fallback range, since imported coordinates belong to another source. Older compilers retain the existing fallback. The server does not require the new compiler flag. Signal termination is reported as a compiler failure separately from a missing executable.
