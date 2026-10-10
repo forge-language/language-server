@@ -21,7 +21,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: forge-language/forge
-          ref: 9b1d1a6c86a688ba56158bd5c014d836c151f289
+          ref: e01b2060eca4bc11ea0af930dfb2455fb20930cf
           path: toolchain
       - run: cmake -S toolchain -B toolchain/build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DCMAKE_INSTALL_PREFIX=${{ runner.temp }}/forge
       - run: cmake --build toolchain/build --target forge forge_runtime forge_std -j2

@@ -13,4 +13,14 @@ if(BUILD_TESTING)
     add_test(NAME native_lsp_protocol COMMAND ${Python3_EXECUTABLE}
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/native_protocol_test.py"
         "${CMAKE_CURRENT_BINARY_DIR}/bin/forge-lsp")
+    if(UNIX)
+        add_test(NAME native_lsp_async_protocol COMMAND ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/native_async_protocol_test.py"
+            "${CMAKE_CURRENT_BINARY_DIR}/bin/forge-lsp")
+        set_tests_properties(native_lsp_async_protocol PROPERTIES TIMEOUT 120)
+        add_test(NAME native_lsp_diagnostics COMMAND ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/native_diagnostics_test.py"
+            "${CMAKE_CURRENT_BINARY_DIR}/bin/forge-lsp" "${FORGE_BIN_DIR}/forge")
+        set_tests_properties(native_lsp_diagnostics PROPERTIES TIMEOUT 30)
+    endif()
 endif()

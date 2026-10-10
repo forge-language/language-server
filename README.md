@@ -56,7 +56,7 @@ The source builds below remain available for other platforms and development.
 
 ## Native server
 
-`native/main.fg` builds to `forge-lsp`, communicating over stdio. Building it requires the compiler's complete CMake SDK: `bin/forge`, headers, runtime/stdlib libraries and `lib/cmake/Forge/ForgeConfig.cmake`. A standalone compiler executable or an SDK download without the CMake package cannot satisfy this build dependency. Use a Forge source build/install when that package is absent.
+`native/main.fg` builds to `forge-lsp`, communicating over stdio. The asynchronous native transport and compiler process API require POSIX; this change is verified on Linux. Use the TypeScript server on Windows. Building requires the compiler's complete CMake SDK: `bin/forge`, headers, runtime/stdlib libraries and `lib/cmake/Forge/ForgeConfig.cmake`. A standalone compiler executable or an SDK download without the CMake package cannot satisfy this build dependency. Use a Forge source build/install when that package is absent. Older SDKs without `proc_start_forge`, `lsp_poll` and `time_monotonic_ms` cannot build this native source.
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=/absolute/path/to/forge-install
@@ -112,7 +112,7 @@ Both servers accept this initialization-options object:
 }
 ```
 
-`forgeRoot` and `libDir` are optional keys inside `forge` for custom SDK layouts. Installed compilers normally locate their own SDK. The native server reads compiler options at initialization; restart its session after changes. The TypeScript server also accepts `workspace/didChangeConfiguration` with `settings.forge`. Keep initialization and configuration objects aligned so updates do not reset overrides.
+`forgeRoot` and `libDir` are optional keys inside `forge` for custom SDK layouts. Installed compilers normally locate their own SDK. Both servers accept `workspace/didChangeConfiguration` with `settings.forge`; settings changes cancel obsolete checks and invalidate symbols. Supply the complete compiler settings on updates so omitted overrides do not reset to defaults.
 
 ## Troubleshooting
 
@@ -124,7 +124,7 @@ Both servers accept this initialization-options object:
 | `Server did not answer initialize` / invalid protocol | Choose the server executable, not the compiler. TypeScript needs built `out/server.js`, Node.js and `--stdio` for a stdio client. Logs must go to stderr. |
 | Terminal doctor passes, editor fails | Set absolute server/compiler paths in the editor, restart its session, and inspect its LSP log. |
 | Syntax highlighting works but there are no diagnostics | Install/enable the separate LSP client and verify attachment. The syntax package alone does not launch a language server. |
-| Native compiler options changed | Restart the LSP session. TypeScript also receives configuration updates. |
+| Compiler options changed | Send `workspace/didChangeConfiguration` with the complete `settings.forge` object, or restart the session. |
 
 For custom layouts, the doctor accepts `--forge-root PATH`, `--lib-dir PATH` and repeated `--include PATH`. `--timeout SECONDS` bounds each compiler/run or protocol operation (default 10, maximum 60). It checks only the executable paths you specify or find through PATH.
 
@@ -136,7 +136,7 @@ For custom layouts, the doctor accepts `--forge-root PATH`, `--lib-dir PATH` and
 
 Forge 컴파일러/SDK, 언어 서버, 에디터 클라이언트는 각각 설치합니다. 먼저 `python3 scripts/doctor.py --compiler /컴파일러/절대경로 --server /언어서버/절대경로`를 실행하세요. 고정된 임시 소스를 컴파일·링크·실행하고 LSP 초기화·종료를 확인하며 자동 다운로드나 프로젝트 설정 실행은 하지 않습니다.
 
-데스크톱 에디터의 PATH가 터미널과 다르면 절대 경로를 지정하세요. Sublime에서는 별도 Forge 문법 패키지와 LSP, LSP-Forge가 필요합니다. 문법 강조만 작동하는 상태에서는 언어 서버 연결 여부를 따로 확인해야 합니다. 네이티브 서버의 설정을 바꾼 뒤에는 LSP 세션을 다시 시작하세요.
+데스크톱 에디터의 PATH가 터미널과 다르면 절대 경로를 지정하세요. Sublime에서는 별도 Forge 문법 패키지와 LSP, LSP-Forge가 필요합니다. 문법 강조만 작동하는 상태에서는 언어 서버 연결 여부를 따로 확인해야 합니다. 두 서버 모두 설정 변경 알림을 지원합니다. 네이티브 비동기 서버는 Linux에서 검증했으며 Windows에서는 TypeScript 서버를 사용하세요.
 
 ## Layout and license
 
@@ -147,9 +147,9 @@ Forge 컴파일러/SDK, 언어 서버, 에디터 클라이언트는 각각 설�
 
 [Apache License 2.0](LICENSE).
 
-## TypeScript responsiveness and native limits
+## Asynchronous diagnostics
 
-The TypeScript server now checks buffers asynchronously with a 150 ms edit debounce,
+Both servers check buffers asynchronously with a 150 ms edit debounce,
 a four-process compiler limit, cancellation and versioned diagnostics. Slow checks
 and symbol queries leave hover and other protocol messages responsive. Pending
 completion and outline requests share a versioned symbol cache. Configuration and
@@ -157,7 +157,9 @@ import changes invalidate pending results; shutdown waits for temporary-source
 cleanup. Compiler checks still process entire buffers and retain a ten-second
 execution timeout.
 
-The native server continues to use synchronous compiler process primitives. It
-does not yet share these responsiveness guarantees. See the
+The native event loop is written in Forge; C supplies process and stdio framing
+primitives. It tracks at most 32 open documents, 32 pending symbol requests and
+four compiler jobs. POSIX child process groups are cancelled and reaped before
+their temporary sources are removed. See the
 [implementation and protocol verification report](docs/async-diagnostics-2026-10-10.md)
 for the exact behavior, tests and remaining limitations.

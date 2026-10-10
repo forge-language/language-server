@@ -1,0 +1,57 @@
+{
+  "fixture_compiler_sleep_ms": 1200,
+  "scope": "Hover after compiler startup; not compiler throughput or language performance.",
+  "platform": "Linux-6.8.0-139-generic-x86_64-with-glibc2.39",
+  "python": "3.12.3",
+  "seed": 20261010,
+  "binary_sha256": {
+    "serial": "c5ed1487bfef037c4fbb42654617ee2267cf9db9a0a8328980077cbcebe9688b",
+    "async": "3fdaa6bb013192077bacd5e1ac2f00bf8b648863b569e6f8f55d57f969e2b217"
+  },
+  "samples": [
+    {
+      "implementation": "async",
+      "hover_ms": 0.261818990111351
+    },
+    {
+      "implementation": "serial",
+      "hover_ms": 1197.1852460410446
+    },
+    {
+      "implementation": "async",
+      "hover_ms": 0.42794994078576565
+    },
+    {
+      "implementation": "serial",
+      "hover_ms": 1205.1515560597181
+    },
+    {
+      "implementation": "serial",
+      "hover_ms": 1202.3643008433282
+    },
+    {
+      "implementation": "serial",
+      "hover_ms": 1206.838850164786
+    },
+    {
+      "implementation": "async",
+      "hover_ms": 0.4376580473035574
+    },
+    {
+      "implementation": "serial",
+      "hover_ms": 1198.3092080336064
+    },
+    {
+      "implementation": "async",
+      "hover_ms": 0.3670330625027418
+    },
+    {
+      "implementation": "async",
+      "hover_ms": 0.40982291102409363
+    }
+  ],
+  "median_hover_ms": {
+    "serial": 1202.3643008433282,
+    "async": 0.40982291102409363
+  }
+}

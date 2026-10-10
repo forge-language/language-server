@@ -5,6 +5,7 @@ import proc;
 import json;
 import docstore;
 import lsprpc;
+import time;
 
 fn is_ident(ch: int): int {
     if (ch >= 65 && ch <= 90) { return 1; }
@@ -25,17 +26,23 @@ fn qs(s: string): string {
 }
 
 fn json_escape(s: string): string {
+    let view: int = str_view(s);
     let n: int = str_len(s);
     let i: int = 0;
     let out: string = "";
     while (i < n) {
-        let ch: int = str_char_at(s, i);
+        let ch: int = str_view_at(view, i);
         if (ch == 34) { out = str_append_str(out, bs()); out = str_append(out, 34); i = i + 1; continue; }
         if (ch == 92) { out = str_append_str(out, bs()); out = str_append(out, 92); i = i + 1; continue; }
         if (ch == 10) { out = str_append_str(out, bs()); out = str_append(out, 110); i = i + 1; continue; }
         if (ch == 13) { out = str_append_str(out, bs()); out = str_append(out, 114); i = i + 1; continue; }
         if (ch == 9) { out = str_append_str(out, bs()); out = str_append(out, 116); i = i + 1; continue; }
-        if (ch < 32) { i = i + 1; continue; }
+        if (ch < 32) {
+            out = str_append_str(out, "\\u00");
+            out = str_append(out, str_char_at("0123456789abcdef", ch / 16));
+            out = str_append(out, str_char_at("0123456789abcdef", ch % 16));
+            i = i + 1; continue;
+        }
         out = str_append(out, ch);
         i = i + 1;
     }
@@ -183,7 +190,7 @@ fn send_notification(method: string, params_raw: string): int {
 }
 
 fn publish_diagnostics(uri: string, diags_array_raw: string): int {
-    let params: string = obj1(join_comma(kv("uri", qs(uri)), kv("diagnostics", diags_array_raw)));
+    let params: string = obj1(join_comma(kv("uri", qesc(uri)), kv("diagnostics", diags_array_raw)));
     return send_notification("textDocument/publishDiagnostics", params);
 }
 
@@ -224,24 +231,66 @@ fn try_diagnostic_from_line(line: string, had_error: int): string {
     return "";
 }
 
-fn parse_diagnostics(output: string, had_error: int): string {
+// Read numeric coordinates from the right: source paths may contain colons.
+// The adjacent location note refines one legacy diagnostic; it is not an error.
+fn diagnostic_with_location(diagnostic: string, note: string, source: string): string {
+    if (str_starts_with(note, "forge: location: ") == 0) { return diagnostic; }
+    let rest: string = extract_after(note, "forge: location: ");
+    let view: int = str_view(rest);
+    let end: int = str_len(rest);
+    let field: int = 0;
+    let sl: int = 0;
+    let sc: int = 0;
+    let el: int = 0;
+    let ec: int = 0;
+    while (field < 4) {
+        let start: int = end;
+        while (start > 0 && str_view_at(view, start - 1) >= 48 && str_view_at(view, start - 1) <= 57) { start = start - 1; }
+        if (start == end || start == 0) { return diagnostic; }
+        let value: int = str_to_int(str_sub(rest, start, end - start));
+        if (value <= 0) { return diagnostic; }
+        let separator: int = 58;
+        if (field == 1) { separator = 45; }
+        if (str_view_at(view, start - 1) != separator) { return diagnostic; }
+        if (field == 0) { ec = value - 1; }
+        if (field == 1) { el = value - 1; }
+        if (field == 2) { sc = value - 1; }
+        if (field == 3) { sl = value - 1; }
+        end = start - 1;
+        field = field + 1;
+    }
+    if (el < sl || (el == sl && ec < sc)) { return diagnostic; }
+    let message: string = json_get_path_str(diagnostic, "message");
+    let file: string = str_sub(rest, 0, end);
+    if (str_eq(file, source)) { return build_diagnostic(sl, sc, el, ec, message); }
+    message = str_append_str(message, str_append_str(" (", rest));
+    message = str_append_str(message, ")");
+    return build_diagnostic(0, 0, 0, 1, message);
+}
+
+fn parse_diagnostics(output: string, had_error: int, source: string): string {
+    let view: int = str_view(output);
     let n: int = str_len(output);
     let i: int = 0;
     let line_start: int = 0;
     let diags: string = "";
+    let pending: string = "";
     while (i <= n) {
         let ch: int = -1;
-        if (i < n) { ch = str_char_at(output, i); }
+        if (i < n) { ch = str_view_at(view, i); }
         if (ch == 10 || i == n) {
             let line: string = str_sub(output, line_start, i - line_start);
-            let d: string = try_diagnostic_from_line(line, had_error);
-            if (str_len(d) > 0) {
-                diags = join_comma(diags, d);
+            if (str_starts_with(line, "forge: location: ")) {
+                if (str_len(pending) > 0) { pending = diagnostic_with_location(pending, line, source); }
+            } else {
+                if (str_len(pending) > 0) { diags = join_comma(diags, pending); pending = ""; }
+                pending = try_diagnostic_from_line(line, had_error);
             }
             line_start = i + 1;
         }
         i = i + 1;
     }
+    if (str_len(pending) > 0) { diags = join_comma(diags, pending); }
     if (had_error == 1 && str_len(diags) == 0) {
         let detail: string = str_trim(output);
         if (str_len(detail) > 2000) { detail = str_sub(detail, 0, 2000); }
@@ -252,55 +301,15 @@ fn parse_diagnostics(output: string, had_error: int): string {
     return arr1(diags);
 }
 
-fn run_diagnostics(uri: string, text: string): int {
-    let tmp: string = fs_temp_path("forge-lsp-check", ".fg");
-    if (str_len(tmp) == 0) {
-        publish_diagnostics(uri, arr1(build_diagnostic(0, 0, 0, 1, "Cannot create a temporary source file. Check the temporary directory and available disk space.")));
-        return 1;
-    }
-    if (fs_write(tmp, text) == 0) {
-        fs_remove(tmp);
-        publish_diagnostics(uri, arr1(build_diagnostic(0, 0, 0, 1, "Cannot write a temporary source file. Check permissions and available disk space.")));
-        return 1;
-    }
-    let status: int = proc_run_forge(
-        cfg_get("forgePath"), tmp, "--check", cfg_get("forgeRoot"),
-        cfg_get("libDir"), cfg_get("includePaths"));
-    let output: string = proc_output();
-    fs_remove(tmp);
-    let had_error: int = 1;
-    if (status == 0) { had_error = 0; }
-    let diags: string = parse_diagnostics(output, had_error);
-    publish_diagnostics(uri, diags);
-    return 1;
-}
-
-fn get_symbols_json(text: string): string {
-    let tmp: string = fs_temp_path("forge-lsp-symbols", ".fg");
-    if (str_len(tmp) == 0) { return "[]"; }
-    if (fs_write(tmp, text) == 0) {
-        fs_remove(tmp);
-        return "[]";
-    }
-    proc_run_forge(
-        cfg_get("forgePath"), tmp, "--symbols-json", cfg_get("forgeRoot"),
-        cfg_get("libDir"), cfg_get("includePaths"));
-    let output: string = proc_output();
-    fs_remove(tmp);
-    let trimmed: string = str_trim(output);
-    if (str_len(trimmed) == 0) { return "[]"; }
-    if (str_char_at(trimmed, 0) != 91) { return "[]"; }
-    return trimmed;
-}
-
 fn find_symbol_pos(text: string, name: string): int {
+    let view: int = str_view(text);
     let n: int = str_len(text);
     let nlen: int = str_len(name);
     let i: int = 0;
     let line: int = 0;
     let line_start: int = 0;
     while (i < n) {
-        let ch: int = str_char_at(text, i);
+        let ch: int = str_view_at(view, i);
         if (ch == 10) {
             line = line + 1;
             line_start = i + 1;
@@ -313,10 +322,10 @@ fn find_symbol_pos(text: string, name: string): int {
                 let ok_before: int = 1;
                 let ok_after: int = 1;
                 if (i > 0) {
-                    if (is_ident(str_char_at(text, i - 1)) == 1) { ok_before = 0; }
+                    if (is_ident(str_view_at(view, i - 1)) == 1) { ok_before = 0; }
                 }
                 if (i + nlen < n) {
-                    if (is_ident(str_char_at(text, i + nlen)) == 1) { ok_after = 0; }
+                    if (is_ident(str_view_at(view, i + nlen)) == 1) { ok_after = 0; }
                 }
                 if (ok_before == 1 && ok_after == 1) {
                     return line * 1000000 + (i - line_start);
@@ -369,11 +378,9 @@ fn symbol_to_lsp_json(item: string, text: string): string {
     return obj1(fields);
 }
 
-fn handle_document_symbol(id_raw: string, msg: string): int {
-    let uri: string = json_get_path_str(msg, "params.textDocument.uri");
-    let text: string = doc_get(uri);
-    let symbols_json: string = get_symbols_json(text);
+fn finish_document_symbol(id_raw: string, text: string, symbols_json: string): int {
     let count: int = json_array_len(symbols_json);
+    if (count > 256) { count = 256; }
     let out: string = "";
     let i: int = 0;
     while (i < count) {
@@ -439,26 +446,21 @@ fn handle_initialize(id_raw: string, msg: string): int {
 }
 
 fn handle_did_open(msg: string): int {
-    let uri: string = json_get_path_str(msg, "params.textDocument.uri");
-    let text: string = json_get_path_str(msg, "params.textDocument.text");
-    doc_set(uri, text);
-    run_diagnostics(uri, text);
-    return 1;
+    return async_edit(msg);
 }
 
 fn handle_did_change(msg: string): int {
-    let uri: string = json_get_path_str(msg, "params.textDocument.uri");
-    let changes: string = json_get_path(msg, "params.contentChanges");
-    let first: string = json_array_at(changes, 0);
-    let text: string = json_get_path_str(first, "text");
-    doc_set(uri, text);
-    run_diagnostics(uri, text);
-    return 1;
+    return async_edit(msg);
 }
 
 fn handle_did_close(msg: string): int {
     let uri: string = json_get_path_str(msg, "params.textDocument.uri");
-    doc_remove(uri);
+    let slot: int = async_find_document(uri);
+    if (slot >= 0) {
+        doc_remove(async_key("document", slot));
+        doc_remove(async_key("text", slot));
+        doc_remove(async_key("symbols", slot));
+    }
     publish_diagnostics(uri, "[]");
     return 1;
 }
@@ -485,7 +487,7 @@ fn stdlib_fn_list(mod: string): string {
     if (str_eq(mod, "io")) { return "print print_int print_str eprint eprint_int eprintln flush flush_err read_line read_char read_stdin prompt write_fd read_fd stdin_fd stdout_fd stderr_fd"; }
     if (str_eq(mod, "strings")) { return "str_len str_concat str_eq str_sub str_contains str_trim str_char_at str_append str_append_str str_from_int str_reset_arena str_view str_view_len str_view_at str_builder str_builder_append str_builder_char str_builder_finish"; }
     if (str_eq(mod, "math")) { return "abs_i abs_f min_i max_i clamp_i pow_i"; }
-    if (str_eq(mod, "time")) { return "time_now_ms sleep_ms"; }
+    if (str_eq(mod, "time")) { return "time_now_ms time_monotonic_ms sleep_ms"; }
     if (str_eq(mod, "fs")) { return "fs_read fs_write fs_append fs_exists fs_remove fs_size fs_is_file fs_is_dir fs_mkdir fs_rename fs_copy fs_list_dir fs_temp_path"; }
     if (str_eq(mod, "os")) { return "os_exit os_getenv os_argc os_argv"; }
     if (str_eq(mod, "tcp")) { return "tcp_listen tcp_accept tcp_connect tcp_send tcp_recv tcp_close net_init"; }
@@ -495,9 +497,9 @@ fn stdlib_fn_list(mod: string): string {
     if (str_eq(mod, "json")) { return "json_get_string json_get_int json_stringify_str json_stringify_int json_get_path json_get_path_str json_get_path_int json_array_len json_array_at"; }
     if (str_eq(mod, "gpu")) { return "gpu_available gpu_backend gpu_device_count gpu_device_name gpu_select_device gpu_alloc gpu_free gpu_copy gpu_sync gpu_fill_i32 gpu_write_i32 gpu_read_i32 gpu_add_i32 gpu_mul_i32 gpu_run_kernel"; }
     if (str_eq(mod, "thread")) { return "thread_cpu_count thread_yield thread_pin thread_self thread_worker_id thread_mutex_create thread_mutex_lock thread_mutex_unlock thread_mutex_destroy thread_join thread_join_all"; }
-    if (str_eq(mod, "proc")) { return "proc_run proc_run_forge proc_output"; }
+    if (str_eq(mod, "proc")) { return "proc_run proc_run_forge proc_output proc_start_forge proc_watch_termination proc_termination_requested proc_poll proc_cancel proc_status proc_signal proc_error_kind proc_stdout proc_stderr proc_release"; }
     if (str_eq(mod, "docstore")) { return "doc_set doc_get doc_remove"; }
-    if (str_eq(mod, "lsprpc")) { return "lsp_read lsp_write"; }
+    if (str_eq(mod, "lsprpc")) { return "lsp_read lsp_poll lsp_message lsp_write"; }
     return "";
 }
 
@@ -643,9 +645,9 @@ fn completion_kind_for_symbol(kind: string): int {
     return 6;
 }
 
-fn symbol_completions(text: string): string {
-    let symbols_json: string = get_symbols_json(text);
+fn symbol_completions(symbols_json: string): string {
     let count: int = json_array_len(symbols_json);
+    if (count > 256) { count = 256; }
     let out: string = "";
     let i: int = 0;
     while (i < count) {
@@ -667,26 +669,25 @@ fn symbol_completions(text: string): string {
     return out;
 }
 
-fn handle_completion(id_raw: string, msg: string): int {
-    let uri: string = json_get_path_str(msg, "params.textDocument.uri");
-    let text: string = doc_get(uri);
+fn finish_completion(id_raw: string, symbols_json: string): int {
     let items: string = "";
     items = join_comma(items, keyword_completions());
     items = join_comma(items, type_completions());
     items = join_comma(items, stdlib_completions());
-    items = join_comma(items, symbol_completions(text));
+    items = join_comma(items, symbol_completions(symbols_json));
     send_result(id_raw, arr1(items));
     return 1;
 }
 
 fn get_line_text(text: string, line: int): string {
+    let view: int = str_view(text);
     let n: int = str_len(text);
     let i: int = 0;
     let cur_line: int = 0;
     let line_start: int = 0;
     while (i < n) {
         if (cur_line == line) { break; }
-        let ch: int = str_char_at(text, i);
+        let ch: int = str_view_at(view, i);
         if (ch == 10) {
             cur_line = cur_line + 1;
             line_start = i + 1;
@@ -695,7 +696,7 @@ fn get_line_text(text: string, line: int): string {
     }
     if (cur_line != line) { return ""; }
     let j: int = line_start;
-    while (j < n && str_char_at(text, j) != 10) {
+    while (j < n && str_view_at(view, j) != 10) {
         j = j + 1;
     }
     return str_sub(text, line_start, j - line_start);
@@ -716,7 +717,7 @@ fn handle_hover(id_raw: string, msg: string): int {
     let uri: string = json_get_path_str(msg, "params.textDocument.uri");
     let line: int = json_get_path_int(msg, "params.position.line");
     let character: int = json_get_path_int(msg, "params.position.character");
-    let text: string = doc_get(uri);
+    let text: string = async_text(uri);
     let line_text: string = get_line_text(text, line);
     let word: string = word_before_cursor(line_text, character);
 
@@ -744,11 +745,28 @@ fn handle_message(msg: string): int {
     let method: string = json_get_path_str(msg, "method");
     let id_raw: string = json_get_path(msg, "id");
 
+    if (str_to_int(cfg_get("stopping")) == 1) {
+        if (str_eq(method, "exit")) { cfg_set("exitRequested", "1"); }
+        else { if (str_len(id_raw) > 0) { send_error(id_raw, 0 - 32600, "Server is shutting down."); } }
+        return 1;
+    }
     if (str_eq(method, "initialize")) {
         handle_initialize(id_raw, msg);
         return 1;
     }
     if (str_eq(method, "initialized")) { return 1; }
+    if (str_eq(method, "$/cancelRequest")) {
+        async_cancel_request(json_get_path(msg, "params.id"));
+        return 1;
+    }
+    if (str_eq(method, "workspace/didChangeConfiguration")) {
+        async_configuration(msg);
+        return 1;
+    }
+    if (str_eq(method, "workspace/didChangeWatchedFiles")) {
+        async_invalidate_all();
+        return 1;
+    }
     if (str_eq(method, "textDocument/didOpen")) {
         handle_did_open(msg);
         return 1;
@@ -762,7 +780,7 @@ fn handle_message(msg: string): int {
         return 1;
     }
     if (str_eq(method, "textDocument/completion")) {
-        handle_completion(id_raw, msg);
+        async_request(id_raw, msg, 1);
         return 1;
     }
     if (str_eq(method, "textDocument/hover")) {
@@ -770,16 +788,18 @@ fn handle_message(msg: string): int {
         return 1;
     }
     if (str_eq(method, "textDocument/documentSymbol")) {
-        handle_document_symbol(id_raw, msg);
+        async_request(id_raw, msg, 2);
         return 1;
     }
     if (str_eq(method, "shutdown")) {
-        send_result(id_raw, "null");
+        cfg_set("shutdownId", id_raw);
+        cfg_set("stopping", "1");
         return 1;
     }
     if (str_eq(method, "exit")) {
-        os_exit(0);
-        return 0;
+        cfg_set("stopping", "1");
+        cfg_set("exitRequested", "1");
+        return 1;
     }
     if (str_len(id_raw) > 0) {
         send_error(id_raw, 0 - 32601, str_append_str("Method not found: ", method));
@@ -787,14 +807,375 @@ fn handle_message(msg: string): int {
     return 1;
 }
 
+// Native scheduling state lives here in Forge. docstore only owns copied strings.
+// Limits: 32 documents, 32 outstanding symbol requests and 4 OS children.
+fn async_key(kind: string, slot: int): string {
+    return str_append_str(str_append_str("__async_", kind), str_from_int(slot));
+}
+
+fn async_find_document(uri: string): int {
+    let i: int = 0;
+    while (i < 32) {
+        let row: string = doc_get(async_key("document", i));
+        if (str_len(row) > 0 && str_eq(json_get_path_str(row, "uri"), uri)) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn async_text(uri: string): string {
+    let slot: int = async_find_document(uri);
+    if (slot < 0) { return ""; }
+    return doc_get(async_key("text", slot));
+}
+
+fn async_document(uri: string, version: int, epoch: int, due: int, dirty: int): string {
+    let fields: string = join_comma(kv("uri", qesc(uri)), kv("version", str_from_int(version)));
+    fields = join_comma(fields, kv("epoch", str_from_int(epoch)));
+    fields = join_comma(fields, kv("due", str_from_int(due)));
+    fields = join_comma(fields, kv("dirty", str_from_int(dirty)));
+    return obj1(fields);
+}
+
+fn async_edit(msg: string): int {
+    if (str_to_int(cfg_get("stopping")) == 1) { return 0; }
+    let uri: string = json_get_path_str(msg, "params.textDocument.uri");
+    let version: int = json_get_path_int(msg, "params.textDocument.version");
+    let slot: int = async_find_document(uri);
+    if (slot < 0) {
+        let i: int = 0;
+        while (i < 32 && slot < 0) {
+            if (str_len(doc_get(async_key("document", i))) == 0) { slot = i; }
+            i = i + 1;
+        }
+    }
+    if (slot < 0) {
+        publish_diagnostics(uri, arr1(build_diagnostic(0, 0, 0, 1, "Native LSP document limit (32) reached. Close another document.")));
+        return 0;
+    }
+    let text: string = json_get_path_str(msg, "params.textDocument.text");
+    if (str_eq(json_get_path_str(msg, "method"), "textDocument/didChange")) {
+        let changes: string = json_get_path(msg, "params.contentChanges");
+        let index: int = 0;
+        while (index < json_array_len(changes)) {
+            text = json_get_path_str(json_array_at(changes, index), "text");
+            index = index + 1;
+        }
+    }
+    let epoch: int = str_to_int(cfg_get("epoch")) + 1;
+    cfg_set("epoch", str_from_int(epoch));
+    doc_set(async_key("text", slot), text);
+    doc_set(async_key("document", slot), async_document(uri, version, epoch, time_monotonic_ms() + 150, 1));
+    doc_remove(async_key("symbols", slot));
+    return 1;
+}
+
+fn async_matches(row: string): int {
+    let slot: int = json_get_path_int(row, "slot");
+    let current: string = doc_get(async_key("document", slot));
+    if (str_len(current) == 0) { return 0; }
+    if (json_get_path_int(current, "epoch") != json_get_path_int(row, "epoch")) { return 0; }
+    if (json_get_path_int(current, "version") != json_get_path_int(row, "version")) { return 0; }
+    if (str_to_int(cfg_get("generation")) != json_get_path_int(row, "generation")) { return 0; }
+    return 1;
+}
+
+fn async_stamp(slot: int, row: string): string {
+    let fields: string = join_comma(kv("slot", str_from_int(slot)), kv("epoch", json_get_path(row, "epoch")));
+    fields = join_comma(fields, kv("version", json_get_path(row, "version")));
+    return join_comma(fields, kv("generation", str_from_int(str_to_int(cfg_get("generation")))));
+}
+
+fn async_request(id_raw: string, msg: string, kind: int): int {
+    let uri: string = json_get_path_str(msg, "params.textDocument.uri");
+    let slot: int = async_find_document(uri);
+    if (slot < 0) {
+        if (kind == 1) { finish_completion(id_raw, "[]"); }
+        else { send_result(id_raw, "[]"); }
+        return 1;
+    }
+    let i: int = 0;
+    while (i < 32) {
+        if (str_len(doc_get(async_key("request", i))) == 0) {
+            let row: string = doc_get(async_key("document", slot));
+            let fields: string = async_stamp(slot, row);
+            fields = join_comma(fields, kv("id", id_raw));
+            fields = join_comma(fields, kv("kind", str_from_int(kind)));
+            doc_set(async_key("request", i), obj1(fields));
+            return 1;
+        }
+        i = i + 1;
+    }
+    send_error(id_raw, 0 - 32000, "Native LSP outstanding request limit (32) reached.");
+    return 0;
+}
+
+fn async_cancel_request(id_raw: string): int {
+    let i: int = 0;
+    while (i < 32) {
+        let row: string = doc_get(async_key("request", i));
+        if (str_len(row) > 0 && str_eq(json_get_path(row, "id"), id_raw)) {
+            send_result(id_raw, "[]");
+            doc_remove(async_key("request", i));
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn async_invalidate_all(): int {
+    cfg_set("generation", str_from_int(str_to_int(cfg_get("generation")) + 1));
+    let i: int = 0;
+    while (i < 32) {
+        let row: string = doc_get(async_key("document", i));
+        if (str_len(row) > 0) {
+            doc_set(async_key("document", i), async_document(json_get_path_str(row, "uri"),
+                json_get_path_int(row, "version"), json_get_path_int(row, "epoch"), time_monotonic_ms() + 150, 1));
+            doc_remove(async_key("symbols", i));
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn async_configuration(msg: string): int {
+    let config: string = json_get_path(msg, "params.settings.forge");
+    if (str_len(config) == 0) { config = json_get_path(msg, "params.settings"); }
+    let fpath: string = json_get_path_str(config, "path");
+    if (str_len(fpath) == 0) { fpath = "forge"; }
+    cfg_set("forgePath", fpath);
+    cfg_set("forgeRoot", json_get_path_str(config, "forgeRoot"));
+    cfg_set("libDir", json_get_path_str(config, "libDir"));
+    let paths: string = "";
+    let raw: string = json_get_path(config, "includePaths");
+    let i: int = 0;
+    while (i < json_array_len(raw)) {
+        if (i > 0) { paths = str_append_str(paths, "\n"); }
+        paths = str_append_str(paths, json_unquote(json_array_at(raw, i)));
+        i = i + 1;
+    }
+    cfg_set("includePaths", paths);
+    return async_invalidate_all();
+}
+
+fn async_hex(ch: int): int {
+    if (ch >= 48 && ch <= 57) { return ch - 48; }
+    if (ch >= 65 && ch <= 70) { return ch - 55; }
+    if (ch >= 97 && ch <= 102) { return ch - 87; }
+    return -1;
+}
+
+fn async_includes(uri: string): string {
+    let paths: string = cfg_get("includePaths");
+    if (str_starts_with(uri, "file:///") == 0) { return paths; }
+    let path: string = "";
+    let i: int = 7;
+    let slash: int = -1;
+    while (i < str_len(uri)) {
+        let ch: int = str_char_at(uri, i);
+        if (ch == 37 && i + 2 < str_len(uri)) {
+            let a: int = async_hex(str_char_at(uri, i + 1));
+            let b: int = async_hex(str_char_at(uri, i + 2));
+            if (a < 0 || b < 0) { return paths; }
+            ch = a * 16 + b;
+            i = i + 2;
+        }
+        if (ch == 0 || ch == 10 || ch == 13) { return paths; }
+        if (ch == 47) { slash = str_len(path); }
+        path = str_append(path, ch);
+        i = i + 1;
+    }
+    if (slash < 0) { return paths; }
+    let directory: string = str_sub(path, 0, slash);
+    if (str_len(directory) == 0) { directory = "/"; }
+    if (str_len(paths) == 0) { return directory; }
+    return str_append_str(str_append_str(directory, "\n"), paths);
+}
+
+fn async_has_job(slot: int, kind: int): int {
+    let i: int = 0;
+    while (i < 4) {
+        let job: string = doc_get(async_key("job", i));
+        if (str_len(job) > 0 && json_get_path_int(job, "slot") == slot && json_get_path_int(job, "kind") == kind) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn async_publish(slot: int, diagnostics: string): int {
+    let row: string = doc_get(async_key("document", slot));
+    let fields: string = join_comma(kv("uri", qesc(json_get_path_str(row, "uri"))), kv("version", json_get_path(row, "version")));
+    fields = join_comma(fields, kv("diagnostics", diagnostics));
+    send_notification("textDocument/publishDiagnostics", obj1(fields));
+    return 1;
+}
+
+fn async_start(slot: int, kind: int): int {
+    let free_slot: int = -1;
+    let i: int = 0;
+    while (i < 4 && free_slot < 0) {
+        if (str_len(doc_get(async_key("job", i))) == 0) { free_slot = i; }
+        i = i + 1;
+    }
+    if (free_slot < 0) { return 0; }
+    let row: string = doc_get(async_key("document", slot));
+    let tmp: string = fs_temp_path("forge-lsp-async", ".fg");
+    let handle: int = -3;
+    let flag: string = "--check";
+    if (kind == 2) { flag = "--symbols-json"; }
+    if (str_len(tmp) > 0) {
+        if (fs_write(tmp, doc_get(async_key("text", slot))) == 1) {
+            handle = proc_start_forge(cfg_get("forgePath"), tmp, flag, cfg_get("forgeRoot"),
+                cfg_get("libDir"), async_includes(json_get_path_str(row, "uri")));
+        }
+    }
+    // Copy stamp before doc_set frees the borrowed document row.
+    let fields: string = async_stamp(slot, row);
+    if (kind == 1) {
+        doc_set(async_key("document", slot), async_document(json_get_path_str(row, "uri"),
+            json_get_path_int(row, "version"), json_get_path_int(row, "epoch"), 0, 0));
+    }
+    if (handle <= 0) {
+        if (str_len(tmp) > 0) { fs_remove(tmp); }
+        if (kind == 2) { doc_set(async_key("symbols", slot), "[]"); }
+        else {
+            let message: string = "Cannot start Forge compiler or prepare source. Check forge.path, SDK and temporary directory.";
+            if (handle == -1) { message = "Native asynchronous compiler checking is unsupported on this platform."; }
+            async_publish(slot, arr1(build_diagnostic(0, 0, 0, 1, message)));
+        }
+        return 1;
+    }
+    fields = join_comma(fields, kv("kind", str_from_int(kind)));
+    fields = join_comma(fields, kv("handle", str_from_int(handle)));
+    fields = join_comma(fields, kv("tmp", qesc(tmp)));
+    fields = join_comma(fields, kv("deadline", str_from_int(time_monotonic_ms() + 10000)));
+    doc_set(async_key("job", free_slot), obj1(fields));
+    return 1;
+}
+
+fn async_poll_jobs(): int {
+    let count: int = 0;
+    let i: int = 0;
+    while (i < 4) {
+        let key: string = async_key("job", i);
+        let job: string = doc_get(key);
+        if (str_len(job) > 0) {
+            let handle: int = json_get_path_int(job, "handle");
+            let valid: int = async_matches(job);
+            let timeout: int = 0;
+            if (time_monotonic_ms() >= json_get_path_int(job, "deadline")) { timeout = 1; }
+            if (valid == 0 || timeout == 1 || str_to_int(cfg_get("stopping")) == 1) { proc_cancel(handle); }
+            let done: int = proc_poll(handle);
+            if (done == 1) {
+                let slot: int = json_get_path_int(job, "slot");
+                if (valid == 1 && str_to_int(cfg_get("stopping")) == 0) {
+                    if (json_get_path_int(job, "kind") == 2) {
+                        let output: string = str_trim(proc_stdout(handle));
+                        if (proc_status(handle) != 0 || proc_error_kind(handle) != 0 || proc_signal(handle) != 0 || str_len(output) == 0) { output = "[]"; }
+                        if (str_len(output) > 0) {
+                            if (str_char_at(output, 0) != 91) { output = "[]"; }
+                        }
+                        doc_set(async_key("symbols", slot), output);
+                    } else {
+                        let error: int = 1;
+                        if (proc_status(handle) == 0 && proc_error_kind(handle) == 0 && proc_signal(handle) == 0) { error = 0; }
+                        let output: string = str_append_str(proc_stderr(handle), proc_stdout(handle));
+                        let diagnostics: string = "[]";
+                        if (proc_error_kind(handle) == 2) {
+                            diagnostics = arr1(build_diagnostic(0, 0, 0, 1, "Forge compiler output exceeded the 1 MiB stream limit."));
+                        } else {
+                            if (timeout == 1) {
+                                diagnostics = arr1(build_diagnostic(0, 0, 0, 1, "Forge compiler check timed out after 10 seconds."));
+                            } else {
+                                if (proc_signal(handle) != 0) {
+                                    diagnostics = arr1(build_diagnostic(0, 0, 0, 1,
+                                        str_append_str("Forge compiler terminated by signal ", str_from_int(proc_signal(handle)))));
+                                } else {
+                                    if (proc_error_kind(handle) == 4) {
+                                        diagnostics = arr1(build_diagnostic(0, 0, 0, 1, "Cannot collect Forge compiler status or output."));
+                                    } else {
+                                        if (str_len(output) > 8192) { output = str_sub(output, 0, 8192); }
+                                        diagnostics = parse_diagnostics(output, error, json_get_path_str(job, "tmp"));
+                                    }
+                                }
+                            }
+                        }
+                        async_publish(slot, diagnostics);
+                    }
+                }
+                fs_remove(json_get_path_str(job, "tmp"));
+                proc_release(handle);
+                doc_remove(key);
+            } else { count = count + 1; }
+        }
+        i = i + 1;
+    }
+    return count;
+}
+
+fn async_tick(): int {
+    let active: int = async_poll_jobs();
+    let stopping: int = str_to_int(cfg_get("stopping"));
+    let i: int = 0;
+    while (i < 32) {
+        let key: string = async_key("request", i);
+        let request: string = doc_get(key);
+        if (str_len(request) > 0) {
+            let id_raw: string = json_get_path(request, "id");
+            let slot: int = json_get_path_int(request, "slot");
+            if (stopping == 1 || async_matches(request) == 0) {
+                send_result(id_raw, "[]"); doc_remove(key);
+            } else {
+                let symbols: string = doc_get(async_key("symbols", slot));
+                if (str_len(symbols) > 0) {
+                    if (json_get_path_int(request, "kind") == 1) { finish_completion(id_raw, symbols); }
+                    else { finish_document_symbol(id_raw, doc_get(async_key("text", slot)), symbols); }
+                    doc_remove(key);
+                } else {
+                    if (async_has_job(slot, 2) == 0) { async_start(slot, 2); }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    if (stopping == 1) {
+        if (active == 0) {
+            let shutdown_id: string = cfg_get("shutdownId");
+            if (str_len(shutdown_id) > 0) { send_result(shutdown_id, "null"); cfg_set("shutdownId", ""); }
+        }
+        return active;
+    }
+    i = 0;
+    while (i < 32) {
+        let row: string = doc_get(async_key("document", i));
+        if (str_len(row) > 0 && json_get_path_int(row, "dirty") == 1 && time_monotonic_ms() >= json_get_path_int(row, "due")) {
+            if (async_has_job(i, 1) == 0) { async_start(i, 1); }
+        }
+        i = i + 1;
+    }
+    return active;
+}
+
 native main {
+    proc_watch_termination();
     let running: int = 1;
     while (running == 1) {
-        let msg: string = lsp_read();
-        if (str_len(msg) == 0) {
-            running = 0;
-            continue;
+        let burst: int = 0;
+        let ready: int = lsp_poll(10);
+        while (ready == 1 && burst < 8) {
+            handle_message(lsp_message());
+            burst = burst + 1;
+            if (burst < 8) { ready = lsp_poll(0); }
         }
-        handle_message(msg);
+        if (ready < 0 || proc_termination_requested() == 1) {
+            cfg_set("stopping", "1");
+            cfg_set("exitRequested", "1");
+            sleep_ms(1);
+        }
+        let active: int = async_tick();
+        if (str_to_int(cfg_get("stopping")) == 1 && str_to_int(cfg_get("exitRequested")) == 1 && active == 0) { running = 0; }
+        // Persistent metadata/text are copied by docstore; temporary arenas need
+        // not grow with every idle polling tick.
+        str_reset_arena();
     }
 }
