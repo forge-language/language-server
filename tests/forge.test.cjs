@@ -131,3 +131,40 @@ test('temporary source preparation failure remains visible to the editor', async
     assert.equal(diagnostics.length,1);assert.match(diagnostics[0].message,/Cannot prepare.*temporary directory/);
   } finally {if(previous===undefined)delete process.env.TMPDIR;else process.env.TMPDIR=previous;}
 });
+
+test('compiler source locations replace fallback ranges without duplicate diagnostics', async () => {
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'forge-test-'));
+  try {
+    const compiler=path.join(dir,'compiler');
+    fs.writeFileSync(compiler,'#!/usr/bin/env node\nprocess.stderr.write("forge: semantic error: unknown name x\\nforge: location: "+process.argv[2]+":3:8-3:11\\n");process.exit(1);\n');
+    fs.chmodSync(compiler,0o755);
+    const diagnostics=await runForgeCheck({...settings,forgePath:compiler},uri,source);
+    assert.equal(diagnostics.length,1);
+    assert.deepEqual(diagnostics[0].range,{start:{line:2,character:7},end:{line:2,character:10}});
+    assert.match(diagnostics[0].message,/unknown name x/);
+  } finally {fs.rmSync(dir,{recursive:true,force:true});}
+});
+test('imported module coordinates are identified without painting them on the current document', async () => {
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'forge-test-'));
+  try {
+    const compiler=path.join(dir,'compiler');
+    fs.writeFileSync(compiler,'#!/usr/bin/env node\nprocess.stderr.write("forge: semantic error: unknown name x\\nforge: location: /tmp/project/a:b module.fg:7:9-8:3\\n");process.exit(1);\n');
+    fs.chmodSync(compiler,0o755);
+    const diagnostics=await runForgeCheck({...settings,forgePath:compiler},uri,source);
+    assert.equal(diagnostics.length,1);
+    assert.deepEqual(diagnostics[0].range,{start:{line:0,character:0},end:{line:0,character:1}});
+    assert.match(diagnostics[0].message,/a:b module.fg:7:9/);
+  } finally {fs.rmSync(dir,{recursive:true,force:true});}
+});
+test('compiler signal termination is reported as a crash rather than a missing executable', async () => {
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'forge-test-'));
+  try {
+    const compiler=path.join(dir,'compiler');
+    fs.writeFileSync(compiler,'#!/usr/bin/env node\nprocess.kill(process.pid,"SIGTERM");\n');
+    fs.chmodSync(compiler,0o755);
+    const diagnostics=await runForgeCheck({...settings,forgePath:compiler},uri,source);
+    assert.equal(diagnostics.length,1);
+    assert.match(diagnostics[0].message,/signal SIGTERM/);
+    assert.doesNotMatch(diagnostics[0].message,/Cannot run Forge compiler/);
+  } finally {fs.rmSync(dir,{recursive:true,force:true});}
+});

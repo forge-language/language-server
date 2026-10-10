@@ -66,6 +66,7 @@ interface CompilerResult {
   signal: NodeJS.Signals | null;
   stdout: string;
   stderr: string;
+  inputFile: string;
   error?: Error;
   failureKind?: 'timeout' | 'output_limit' | 'spawn';
 }
@@ -106,9 +107,10 @@ async function runCompiler(
             return;
           }
           const status = error ? typeof error.code === 'number' ? error.code : null : 0;
-          const invocationError = error && typeof error.code !== 'number' ? error : undefined;
+          const invocationError = error && typeof error.code !== 'number' &&
+            (error.killed || !error.signal) ? error : undefined;
           resolve({
-            status, signal: error?.signal ?? null, stdout, stderr,
+            status, signal: error?.signal ?? null, stdout, stderr, inputFile: file,
             error: invocationError,
             failureKind: invocationError
               ? invocationError.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER'
@@ -167,8 +169,30 @@ export async function runForgeCheck(
     return [{ severity: DiagnosticSeverity.Error, range: Range.create(0, 0, 0, 1), message, source: 'forge' }];
   }
   const stderr = `${result.stderr ?? ''}${result.stdout ?? ''}`;
-  for (const line of stderr.split('\n')) {
+  const lines = stderr.split('\n');
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index];
     if (!line.startsWith('forge:')) continue;
+    if (line.startsWith('forge: location: ')) continue;
+    // New compilers retain the legacy error line and follow it with an exact
+    // source range. Read the suffix from the right: filenames may contain ':'.
+    const location = lines[index + 1]?.match(/^forge: location: (.+):(\d+):(\d+)-(\d+):(\d+)$/);
+    if (location && result.status !== 0) {
+      const coordinates = location.slice(2).map(Number);
+      const [startLine, startCol, endLine, endCol] = coordinates;
+      const valid = coordinates.every(value => Number.isSafeInteger(value) && value > 0) &&
+        (endLine > startLine || (endLine === startLine && endCol >= startCol));
+      if (valid) {
+        const imported = location[1] !== result.inputFile;
+        diagnostics.push({ severity: DiagnosticSeverity.Error,
+          range: imported ? Range.create(0, 0, 0, 1) :
+            Range.create(startLine - 1, startCol - 1, endLine - 1, endCol - 1),
+          message: `${line.replace(/^forge:\s*/, '')}${imported ? ` (${location[1]}:${startLine}:${startCol})` : ''}`,
+          source: 'forge' });
+        index++;
+        continue;
+      }
+    }
     const m = line.match(/forge: parse error at (\d+):(\d+): (.+)/);
     if (m) {
       const lineNo = Math.max(0, parseInt(m[1], 10) - 1);
