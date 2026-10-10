@@ -32,6 +32,7 @@
     "out",
     "README.md",
     "LICENSE",
-    "scripts/doctor.py"
+    "scripts/doctor.py",
+    "docs"
   ]
 }

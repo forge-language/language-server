@@ -1,4 +1,4 @@
-import { spawnSync, SpawnSyncReturns } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -24,22 +24,112 @@ export function defaultForgePath(_workspaceRoot?: string): string {
   return 'forge';
 }
 
-function runCompiler(settings: ForgeSettings, uri: string, text: string, extra: string[]): SpawnSyncReturns<string> {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-lsp-'));
+const compilerLimit = 4;
+let runningCompilers = 0;
+const compilerQueue: Array<() => void> = [];
+
+function acquireCompiler(signal?: AbortSignal): Promise<() => void> {
+  signal?.throwIfAborted();
+  return new Promise((resolve, reject) => {
+    const cancelled = () => {
+      const index = compilerQueue.indexOf(start);
+      if (index >= 0) compilerQueue.splice(index, 1);
+      signal?.removeEventListener('abort', cancelled);
+      reject(signal?.reason ?? new Error('Compiler cancelled'));
+    };
+    const start = () => {
+      signal?.removeEventListener('abort', cancelled);
+      if (signal?.aborted) {
+        reject(signal.reason);
+        return;
+      }
+      runningCompilers++;
+      let released = false;
+      resolve(() => {
+        if (released) return;
+        released = true;
+        runningCompilers--;
+        const next = compilerQueue.shift();
+        if (next) next();
+      });
+    };
+    if (runningCompilers < compilerLimit) start();
+    else {
+      compilerQueue.push(start);
+      signal?.addEventListener('abort', cancelled, { once: true });
+    }
+  });
+}
+
+interface CompilerResult {
+  status: number | null;
+  signal: NodeJS.Signals | null;
+  stdout: string;
+  stderr: string;
+  error?: Error;
+  failureKind?: 'timeout' | 'output_limit' | 'spawn';
+}
+
+async function runCompiler(
+  settings: ForgeSettings,
+  uri: string,
+  text: string,
+  extra: string[],
+  signal?: AbortSignal,
+): Promise<CompilerResult> {
+  signal?.throwIfAborted();
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'forge-lsp-'));
   try {
     const file = path.join(dir, 'buffer.fg');
-    fs.writeFileSync(file, text, 'utf8');
-    // Unsaved buffers live in /tmp; preserve imports relative to the original file.
+    await fs.promises.writeFile(file, text, 'utf8');
+    signal?.throwIfAborted();
     const localSettings = { ...settings, includePaths: [...settings.includePaths] };
     try {
-      const sourceDir = path.dirname(fileURLToPath(uri));
-      localSettings.includePaths.unshift(sourceDir);
+      localSettings.includePaths.unshift(path.dirname(fileURLToPath(uri)));
     } catch { /* Non-file documents have no local module directory. */ }
-    return spawnSync(settings.forgePath, forgeArgs(localSettings, file, extra), {
-      encoding: 'utf8', maxBuffer: 1024 * 1024, timeout: 10_000,
-    });
+
+    const release = await acquireCompiler(signal);
+    try {
+      return await new Promise<CompilerResult>((resolve, reject) => {
+        let settled = false;
+        const child = execFile(settings.forgePath, forgeArgs(localSettings, file, extra), {
+          encoding: 'utf8',
+          maxBuffer: 1024 * 1024,
+          timeout: 10_000,
+          killSignal: 'SIGKILL',
+        }, (error, stdout, stderr) => {
+          if (settled) return;
+          settled = true;
+          signal?.removeEventListener('abort', abort);
+          if (signal?.aborted) {
+            reject(signal.reason ?? new Error('Compiler cancelled'));
+            return;
+          }
+          const status = error ? typeof error.code === 'number' ? error.code : null : 0;
+          const invocationError = error && typeof error.code !== 'number' ? error : undefined;
+          resolve({
+            status, signal: error?.signal ?? null, stdout, stderr,
+            error: invocationError,
+            failureKind: invocationError
+              ? invocationError.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER'
+                ? 'output_limit'
+                : invocationError.killed ? 'timeout' : 'spawn'
+              : undefined,
+          });
+        });
+        // Wait for execFile's terminal callback before deleting the source.
+        // Removing this listener prevents a late abort from killing a finished child.
+        const abort = () => {
+          if (!settled) child.kill('SIGKILL');
+        };
+        signal?.addEventListener('abort', abort, { once: true });
+        if (signal?.aborted) abort();
+      });
+    } finally {
+      release();
+    }
   } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
+    await fs.promises.rm(dir, { recursive: true, force: true });
   }
 }
 
@@ -51,17 +141,30 @@ function forgeArgs(settings: ForgeSettings, file: string, extra: string[]): stri
   return args;
 }
 
-export function runForgeCheck(
+export async function runForgeCheck(
   settings: ForgeSettings,
   uri: string,
   text: string,
-): Diagnostic[] {
-  const result = runCompiler(settings, uri, text, ['--check']);
+  signal?: AbortSignal,
+): Promise<Diagnostic[]> {
+  let result: CompilerResult;
+  try {
+    result = await runCompiler(settings, uri, text, ['--check'], signal);
+  } catch (error) {
+    if (signal?.aborted) throw error;
+    return [{ severity: DiagnosticSeverity.Error, range: Range.create(0, 0, 0, 1),
+      message: `Cannot prepare Forge compiler check: ${error instanceof Error ? error.message : String(error)}. Check the compiler configuration and temporary directory.`,
+      source: 'forge' }];
+  }
 
   const diagnostics: Diagnostic[] = [];
   if (result.error) {
-    return [{ severity: DiagnosticSeverity.Error, range: Range.create(0, 0, 0, 1),
-      message: `Cannot run Forge compiler: ${result.error.message}. Install Forge or set forge.path to its executable.`, source: 'forge' }];
+    const message = result.failureKind === 'timeout'
+      ? 'Forge compiler check timed out after 10 seconds.'
+      : result.failureKind === 'output_limit'
+        ? 'Forge compiler output exceeded the 1 MiB diagnostic limit.'
+        : `Cannot run Forge compiler: ${result.error.message}. Install Forge or set forge.path to its executable.`;
+    return [{ severity: DiagnosticSeverity.Error, range: Range.create(0, 0, 0, 1), message, source: 'forge' }];
   }
   const stderr = `${result.stderr ?? ''}${result.stdout ?? ''}`;
   for (const line of stderr.split('\n')) {
@@ -98,12 +201,13 @@ export function runForgeCheck(
   return diagnostics;
 }
 
-export function runForgeSymbols(
+export async function runForgeSymbols(
   settings: ForgeSettings,
   uri: string,
   text: string,
-): ForgeSymbol[] {
-  const result = runCompiler(settings, uri, text, ['--symbols-json']);
+  signal?: AbortSignal,
+): Promise<ForgeSymbol[]> {
+  const result = await runCompiler(settings, uri, text, ['--symbols-json'], signal);
   if (result.status !== 0 || !result.stdout) return scanSymbolsFromText(text);
   try {
     return JSON.parse(result.stdout) as ForgeSymbol[];

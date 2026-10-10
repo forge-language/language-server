@@ -146,3 +146,18 @@ Forge 컴파일러/SDK, 언어 서버, 에디터 클라이언트는 각각 설�
 - `scripts/`: doctor and optional Claude Code integration.
 
 [Apache License 2.0](LICENSE).
+
+## TypeScript responsiveness and native limits
+
+The TypeScript server now checks buffers asynchronously with a 150 ms edit debounce,
+a four-process compiler limit, cancellation and versioned diagnostics. Slow checks
+and symbol queries leave hover and other protocol messages responsive. Pending
+completion and outline requests share a versioned symbol cache. Configuration and
+import changes invalidate pending results; shutdown waits for temporary-source
+cleanup. Compiler checks still process entire buffers and retain a ten-second
+execution timeout.
+
+The native server continues to use synchronous compiler process primitives. It
+does not yet share these responsiveness guarantees. See the
+[implementation and protocol verification report](docs/async-diagnostics-2026-10-10.md)
+for the exact behavior, tests and remaining limitations.
